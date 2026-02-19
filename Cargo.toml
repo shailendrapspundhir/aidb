@@ -6,13 +6,30 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 sled = "0.34"
-arrow = "52"
+arrow = { version = "52", features = ["ipc"] }
 instant-distance = "0.6"
 datafusion = "40"
 tonic = "0.12"
 raft-engine = "0.4"
 prost = "0.13"
 futures = "0.3"
+# Serde for NoSQL/JSON document support (dynamic schemas in Sled)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Axum for REST API exposure (Tokio-native, JSON handlers on port 11111)
+# Mirrors multi-model endpoints (insert_doc, sql, hybrid) for curl-friendly access
+axum = { version = "0.7", features = ["json"] }
+tower = "0.4"  # For HTTP server layers
 
 [build-dependencies]
 tonic-build = "0.12"
+
+# Binary for main server/DB
+[[bin]]
+name = "my_ai_db"
+path = "src/main.rs"
+
+# Load data script/binary to populate the storage with sample data
+[[bin]]
+name = "load_data"
+path = "scripts/load_data.rs"

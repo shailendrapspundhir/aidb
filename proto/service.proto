@@ -2,14 +2,74 @@ syntax = "proto3";
 
 package aidb;
 
+// aiDB gRPC Service for multi-model database
+// Unified layer for SQL (DataFusion), NoSQL (JSON/Serde in Sled), Vectors (HNSW)
+// Supports hybrid queries with predicate push-down for performance.
+
 service AiDbService {
+  // Insert metadata (as Arrow internally) and vector into storage
+  rpc Insert (InsertRequest) returns (InsertResponse);
+  // Insert full NoSQL Document (JSON for unstructured/flexible schema)
+  rpc InsertDoc (InsertDocRequest) returns (InsertResponse);
+  // Text-based search (placeholder)
   rpc Search (SearchRequest) returns (SearchResponse);
+  // Vector-based ANN search using HNSW index
+  rpc VectorSearch (VectorSearchRequest) returns (SearchResponse);
+  // Execute SQL query on projected Arrow data (from NoSQL JSON)
+  // Enables structured queries on docs table (e.g., SELECT * FROM docs WHERE category='AI')
+  rpc ExecuteSql (SqlRequest) returns (SqlResponse);
+  // Hybrid search: SQL filter + vector similarity (push-down optimized)
+  // e.g., category filter on SQL + ANN for max perf without data movement
+  rpc HybridSearch (HybridRequest) returns (HybridResponse);
+}
+
+message InsertRequest {
+  string id = 1;
+  string text = 2;  // Metadata text, converted to Arrow RecordBatch
+  repeated float vector = 3;  // Embedding vector stored in Sled
+}
+
+message InsertDocRequest {
+  string id = 1;
+  string text = 2;
+  string category = 3;  // For SQL filtering
+  repeated float vector = 4;
+  string metadata_json = 5;  // Flexible NoSQL JSON blob (Serde)
+}
+
+message InsertResponse {
+  bool success = 1;
 }
 
 message SearchRequest {
   string query = 1;
 }
 
+message VectorSearchRequest {
+  repeated float query_vector = 1;  // Query embedding
+  uint32 top_k = 2;  // Number of nearest neighbors
+}
+
+message SqlRequest {
+  string sql = 1;  // SQL query on 'docs' table (DataFusion)
+}
+
+message SqlResponse {
+  // Serialized Arrow IPC for results (vectorized SQL output)
+  bytes arrow_data = 1;
+}
+
+message HybridRequest {
+  string sql_filter = 1;  // SQL predicate (e.g., "category = 'AI'")
+  repeated float query_vector = 2;  // For vector ANN
+  uint32 top_k = 3;
+}
+
+message HybridResponse {
+  repeated string results = 1;  // Doc IDs or serialized JSON
+  // Extend with full docs for NoSQL return
+}
+
 message SearchResponse {
-  repeated string results = 1;
+  repeated string results = 1;  // IDs of matching documents
 }
