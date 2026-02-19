@@ -10,7 +10,7 @@ arrow = "52"
 instant-distance = "0.6"
 datafusion = "40"
 tonic = "0.12"
-raft-engine = "0.5"
+raft-engine = "0.4"
 prost = "0.13"
 futures = "0.3"
 
