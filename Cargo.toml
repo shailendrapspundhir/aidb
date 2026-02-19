@@ -1,0 +1,18 @@
+[package]
+name = "my_ai_db"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+sled = "0.34"
+arrow = "52"
+instant-distance = "0.6"
+datafusion = "40"
+tonic = "0.12"
+raft-engine = "0.5"
+prost = "0.13"
+futures = "0.3"
+
+[build-dependencies]
+tonic-build = "0.12"
