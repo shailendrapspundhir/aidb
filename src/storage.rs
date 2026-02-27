@@ -6,8 +6,9 @@ use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sled::Db;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Document struct for NoSQL/JSON support
 /// Enables schema-flexible storage in Sled (Serde-serialized).
@@ -32,6 +33,88 @@ pub struct Storage {
     metadata_tree: sled::Tree,
     vector_tree: sled::Tree,
     doc_tree: sled::Tree,  // For NoSQL/JSON docs
+    doc_cache: Arc<Mutex<DocCache>>, // In-memory cache for docs
+}
+
+#[derive(Clone, Debug)]
+struct CacheEntry {
+    doc: Document,
+    size_bytes: usize,
+}
+
+#[derive(Debug)]
+struct DocCache {
+    capacity_bytes: usize,
+    size_bytes: usize,
+    entries: HashMap<String, CacheEntry>,
+    lru_order: VecDeque<String>,
+}
+
+impl DocCache {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            capacity_bytes,
+            size_bytes: 0,
+            entries: HashMap::new(),
+            lru_order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, id: &str) -> Option<Document> {
+        if let Some(entry) = self.entries.get(id) {
+            self.touch(id);
+            return Some(entry.doc.clone());
+        }
+        None
+    }
+
+    fn insert(&mut self, id: String, doc: Document) {
+        let size_bytes = estimate_doc_size_bytes(&doc);
+        if size_bytes > self.capacity_bytes {
+            return;
+        }
+        if let Some(existing) = self.entries.remove(&id) {
+            self.size_bytes = self.size_bytes.saturating_sub(existing.size_bytes);
+            self.lru_order.retain(|key| key != &id);
+        }
+        while self.size_bytes + size_bytes > self.capacity_bytes {
+            if let Some(evict_id) = self.lru_order.pop_back() {
+                if let Some(evicted) = self.entries.remove(&evict_id) {
+                    self.size_bytes = self.size_bytes.saturating_sub(evicted.size_bytes);
+                }
+            } else {
+                break;
+            }
+        }
+        self.size_bytes += size_bytes;
+        self.lru_order.push_front(id.clone());
+        self.entries.insert(id, CacheEntry { doc, size_bytes });
+    }
+
+    fn remove(&mut self, id: &str) {
+        if let Some(entry) = self.entries.remove(id) {
+            self.size_bytes = self.size_bytes.saturating_sub(entry.size_bytes);
+            self.lru_order.retain(|key| key != id);
+        }
+    }
+
+    fn touch(&mut self, id: &str) {
+        self.lru_order.retain(|key| key != id);
+        self.lru_order.push_front(id.to_string());
+    }
+}
+
+fn estimate_doc_size_bytes(doc: &Document) -> usize {
+    doc.id.len()
+        + doc.text.len()
+        + doc.category.len()
+        + doc.vector.len() * std::mem::size_of::<f32>()
+        + doc.metadata.to_string().len()
+}
+
+fn read_cache_capacity_mb() -> usize {
+    let raw = std::env::var("AIDB_CACHE_MB").unwrap_or_else(|_| "64".to_string());
+    raw.trim().parse::<usize>().unwrap_or(64)
 }
 
 impl Storage {
@@ -44,11 +127,14 @@ impl Storage {
         let metadata_tree = db.open_tree("metadata")?;
         let vector_tree = db.open_tree("vectors")?;
         let doc_tree = db.open_tree("docs")?;  // NoSQL JSON storage
+        let capacity_mb = read_cache_capacity_mb();
+        let capacity_bytes = capacity_mb.saturating_mul(1024).saturating_mul(1024);
         Ok(Self {
             db,
             metadata_tree,
             vector_tree,
             doc_tree,
+            doc_cache: Arc::new(Mutex::new(DocCache::new(capacity_bytes))),
         })
     }
 
@@ -127,15 +213,38 @@ impl Storage {
         let metadata_batch = create_metadata_batch(&doc.id, &doc.text)?;
         self.insert(&doc.id, metadata_batch, doc.vector.clone())?;  // Reuses vector storage
 
+        // Update cache
+        if let Ok(mut cache) = self.doc_cache.lock() {
+            cache.insert(doc.id.clone(), doc);
+        }
+
         Ok(())
     }
 
     /// Retrieve NoSQL Document by ID (deserializes JSON from Sled)
     /// Enables dynamic/unstructured access.
     pub fn get_doc(&self, id: &str) -> Result<Document, Box<dyn std::error::Error>> {
+        let (doc, _) = self.get_doc_with_cache_status(id)?;
+        Ok(doc)
+    }
+
+    /// Retrieve NoSQL Document by ID, returning if it was served from cache.
+    pub fn get_doc_with_cache_status(
+        &self,
+        id: &str,
+    ) -> Result<(Document, bool), Box<dyn std::error::Error>> {
+        if let Ok(mut cache) = self.doc_cache.lock() {
+            if let Some(doc) = cache.get(id) {
+                return Ok((doc, true));
+            }
+        }
+
         if let Some(doc_bytes) = self.doc_tree.get(id.as_bytes())? {
             let doc: Document = serde_json::from_slice(&doc_bytes)?;
-            Ok(doc)
+            if let Ok(mut cache) = self.doc_cache.lock() {
+                cache.insert(id.to_string(), doc.clone());
+            }
+            Ok((doc, false))
         } else {
             Err("Document not found".into())
         }
@@ -225,6 +334,10 @@ impl Storage {
         let metadata_batch = create_metadata_batch(&doc.id, &doc.text)?;
         self.insert(&doc.id, metadata_batch, doc.vector.clone())?;
 
+        if let Ok(mut cache) = self.doc_cache.lock() {
+            cache.insert(doc.id.clone(), doc);
+        }
+
         Ok(())
     }
 
@@ -233,6 +346,9 @@ impl Storage {
         self.doc_tree.remove(id.as_bytes())?;
         self.metadata_tree.remove(id.as_bytes())?;
         self.vector_tree.remove(id.as_bytes())?;
+        if let Ok(mut cache) = self.doc_cache.lock() {
+            cache.remove(id);
+        }
         // Note: For full SQL sync , re-project Arrow table post-delete in prod
         Ok(())
     }

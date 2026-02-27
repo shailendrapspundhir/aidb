@@ -41,6 +41,8 @@ pub struct RestResponse {
     pub success: bool,
     pub message: String,
     pub results: Vec<String>,  // IDs or query results
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hits: Option<Vec<bool>>, // True if fetched from cache
 }
 
 /// Create Axum router with multi-model endpoints
@@ -91,6 +93,7 @@ async fn insert_doc_handler(
             success: true,
             message: "NoSQL JSON doc inserted to Sled".to_string(),
             results: vec![],
+            cache_hits: None,
         }))
     } else {
         Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -141,6 +144,7 @@ async fn sql_handler(
         success: true,
         message: format!("SQL executed: {} rows", res_ids.len()),
         results: res_ids,
+        cache_hits: None,
     }))
 }
 
@@ -164,12 +168,14 @@ async fn hybrid_handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let results: Vec<String> = docs.iter().map(|d| d.id.clone()).collect();
+    let results: Vec<String> = docs.iter().map(|(doc, _)| doc.id.clone()).collect();
+    let cache_hits: Vec<bool> = docs.iter().map(|(_, from_cache)| *from_cache).collect();
 
     Ok(Json(RestResponse {
         success: true,
         message: format!("Hybrid search found {} docs", results.len()),
         results,
+        cache_hits: Some(cache_hits),
     }))
 }
 
@@ -187,6 +193,7 @@ async fn health_handler() -> Json<RestResponse> {
         success: true,
         message: "aiDB REST API healthy (multi-model on 11111)".to_string(),
         results: vec![],
+        cache_hits: None,
     })
 }
 
@@ -216,6 +223,7 @@ async fn update_doc_handler(
             success: true,
             message: "NoSQL doc updated".to_string(),
             results: vec![],
+            cache_hits: None,
         }))
     } else {
         Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -232,6 +240,7 @@ async fn delete_doc_handler(
             success: true,
             message: format!("Doc {} deleted", id),
             results: vec![],
+            cache_hits: None,
         }))
     } else {
         Err(StatusCode::NOT_FOUND)

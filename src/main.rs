@@ -189,9 +189,10 @@ impl AiDbService for AiDbServiceImpl {
             .map_err(|e| Status::internal(format!("Hybrid query error: {}", e)))?;
 
         // Results as IDs (extend to full JSON for NoSQL response)
-        let results: Vec<String> = docs.iter().map(|d| d.id.clone()).collect();
+        let results: Vec<String> = docs.iter().map(|(doc, _)| doc.id.clone()).collect();
+        let cache_hits: Vec<bool> = docs.iter().map(|(_, from_cache)| *from_cache).collect();
 
-        Ok(Response::new(HybridResponse { results }))
+        Ok(Response::new(HybridResponse { results, cache_hits }))
     }
 }
 

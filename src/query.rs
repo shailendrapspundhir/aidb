@@ -50,7 +50,7 @@ impl QueryEngine {
         sql_filter: &str,  // e.g., "category = 'AI'"
         query_vector: &[f32],
         top_k: usize,
-    ) -> Result<Vec<Document>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<(Document, bool)>, Box<dyn std::error::Error>> {
         // Step 1: Vector indexing for candidates (ANN)
         let storage = Storage::open("aidb_data")?;  // Shared storage
         let vectors = storage.get_all_vectors()?;
@@ -74,8 +74,8 @@ impl QueryEngine {
             if let Some(id_col) = batch.column(0).as_any().downcast_ref::<arrow::array::StringArray>() {
                 for i in 0..id_col.len() {
                     let id = id_col.value(i);
-                    if let Ok(doc) = storage.get_doc(id) {
-                        docs.push(doc);
+                    if let Ok((doc, from_cache)) = storage.get_doc_with_cache_status(id) {
+                        docs.push((doc, from_cache));
                     }
                 }
             }

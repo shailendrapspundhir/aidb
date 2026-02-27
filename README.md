@@ -23,7 +23,10 @@ Future phases: full DataFusion integration, Raft clustering, HTTP gateway.
 # 1. Populate database with sample data (10 docs w/ Arrow metadata + vectors)
 cargo run --bin load_data
 
-# 2. Start the aiDB gRPC server
+# 2. (Optional) Set cache size in MB (defaults to 64 if unset)
+export AIDB_CACHE_MB=128
+
+# 3. Start the aiDB gRPC server
 cargo run --bin my_ai_db
 ```
 

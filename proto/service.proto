@@ -67,6 +67,7 @@ message HybridRequest {
 
 message HybridResponse {
   repeated string results = 1;  // Doc IDs or serialized JSON
+  repeated bool cache_hits = 2; // True if doc fetched from cache
   // Extend with full docs for NoSQL return
 }
 
