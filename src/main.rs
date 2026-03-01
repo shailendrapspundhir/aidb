@@ -26,6 +26,8 @@ use my_ai_db::indexing::VectorIndex;
 use my_ai_db::query::QueryEngine;
 use my_ai_db::rest::create_router;  // REST router
 use serde_json;  // For JSON in NoSQL insert_doc RPC
+use my_ai_db::models::{User, Tenant, Environment, Collection, AuthPayload};
+use my_ai_db::auth::{hash_password, verify_password, create_jwt, validate_jwt};
 
 // Include generated proto code (from tonic-build on aidb package)
 // Regenerates on build for new multi-model RPCs
@@ -37,6 +39,9 @@ use aidb::{
     ai_db_service_server::{AiDbService, AiDbServiceServer},
     HybridRequest, HybridResponse, InsertDocRequest, InsertRequest, InsertResponse,
     SearchRequest, SearchResponse, SqlRequest, SqlResponse, VectorSearchRequest,
+    RegisterRequest, RegisterResponse, LoginRequest, LoginResponse,
+    CreateTenantRequest, CreateTenantResponse, CreateEnvironmentRequest, CreateEnvironmentResponse,
+    CreateCollectionRequest, CreateCollectionResponse,
 };
 
 /// Service implementation for AiDbService
@@ -54,18 +59,125 @@ impl AiDbServiceImpl {
     pub fn new(storage: Storage) -> Self {
         Self { storage }
     }
+
+    fn check_auth(&self, metadata: &tonic::metadata::MetadataMap) -> Result<AuthPayload, Status> {
+        let token = metadata.get("authorization")
+            .ok_or(Status::unauthenticated("Missing token"))?
+            .to_str()
+            .map_err(|_| Status::unauthenticated("Invalid token"))?;
+
+        let token = if token.starts_with("Bearer ") { &token[7..] } else { token };
+        validate_jwt(token).map_err(|_| Status::unauthenticated("Invalid token"))
+    }
 }
 
 #[tonic::async_trait]
 impl AiDbService for AiDbServiceImpl {
+    async fn register(
+        &self,
+        request: Request<RegisterRequest>,
+    ) -> Result<Response<RegisterResponse>, Status> {
+        let req = request.into_inner();
+        let hash = hash_password(&req.password).map_err(|_| Status::internal("Hash failed"))?;
+        let user = User {
+            username: req.username.clone(),
+            password_hash: hash,
+            tenants: vec![],
+        };
+        self.storage.create_user(user).map_err(|e| Status::already_exists(e.to_string()))?;
+        Ok(Response::new(RegisterResponse { success: true }))
+    }
+
+    async fn login(
+        &self,
+        request: Request<LoginRequest>,
+    ) -> Result<Response<LoginResponse>, Status> {
+        let req = request.into_inner();
+        let user = self.storage.get_user(&req.username)
+            .map_err(|_| Status::internal("DB error"))?
+            .ok_or(Status::unauthenticated("User not found"))?;
+
+        if !verify_password(&req.password, &user.password_hash).unwrap_or(false) {
+            return Err(Status::unauthenticated("Invalid password"));
+        }
+
+        let token = create_jwt(&user.username).map_err(|_| Status::internal("Token gen failed"))?;
+        Ok(Response::new(LoginResponse { token }))
+    }
+
+    async fn create_tenant(
+        &self,
+        request: Request<CreateTenantRequest>,
+    ) -> Result<Response<CreateTenantResponse>, Status> {
+        let claims = self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        let tenant = Tenant {
+            id: req.id.clone(),
+            name: req.name,
+            owner_id: claims.sub.clone(),
+            environments: vec![],
+        };
+        self.storage.create_tenant(tenant).map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(mut user) = self.storage.get_user(&claims.sub).unwrap() {
+             user.tenants.push(req.id);
+             self.storage.update_user(user).unwrap();
+        }
+        Ok(Response::new(CreateTenantResponse { success: true }))
+    }
+
+    async fn create_environment(
+        &self,
+        request: Request<CreateEnvironmentRequest>,
+    ) -> Result<Response<CreateEnvironmentResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        let env = Environment {
+            id: req.id.clone(),
+            name: req.name,
+            tenant_id: req.tenant_id.clone(),
+            collections: vec![],
+        };
+        self.storage.create_environment(env).map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(mut tenant) = self.storage.get_tenant(&req.tenant_id).unwrap() {
+             tenant.environments.push(req.id);
+             self.storage.update_tenant(tenant).unwrap();
+        }
+        Ok(Response::new(CreateEnvironmentResponse { success: true }))
+    }
+
+    async fn create_collection(
+        &self,
+        request: Request<CreateCollectionRequest>,
+    ) -> Result<Response<CreateCollectionResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        let col = Collection {
+            id: req.id.clone(),
+            name: req.name,
+            environment_id: req.env_id.clone(),
+        };
+        self.storage.create_collection(col).map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(mut env) = self.storage.get_environment(&req.env_id).unwrap() {
+             env.collections.push(req.id);
+             self.storage.update_environment(env).unwrap();
+        }
+        Ok(Response::new(CreateCollectionResponse { success: true }))
+    }
+
     /// Insert: Writes an Arrow record (metadata) and vector to Sled by ID
     /// This fulfills the core storage requirement
     async fn insert(
         &self,
         request: Request<InsertRequest>,
     ) -> Result<Response<InsertResponse>, Status> {
+        self.check_auth(request.metadata())?;
         let req = request.into_inner();
+        let collection_id = req.collection_id;
+        if collection_id.is_empty() { return Err(Status::invalid_argument("Missing collection_id")); }
+
         println!("📥 Insert request for ID: {}", req.id);
+
+        let key = format!("{}/{}", collection_id, req.id);
 
         // Create Arrow RecordBatch metadata
         let metadata_batch = my_ai_db::storage::create_metadata_batch(&req.id, &req.text)
@@ -73,7 +185,7 @@ impl AiDbService for AiDbServiceImpl {
 
         // Store in Sled KV (separate trees for metadata/vectors)
         self.storage
-            .insert(&req.id, metadata_batch, req.vector)
+            .insert(&key, metadata_batch, req.vector)
             .map_err(|e| Status::internal(format!("Sled storage error: {}", e)))?;
 
         // Index rebuild is on-search for simplicity (prod: incremental or persistent index)
@@ -85,6 +197,7 @@ impl AiDbService for AiDbServiceImpl {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        self.check_auth(request.metadata())?;
         let req = request.into_inner();
         println!("🔍 Text search query: {}", req.query);
         // TODO: Implement robust querying with DataFusion over Arrow metadata
@@ -99,11 +212,13 @@ impl AiDbService for AiDbServiceImpl {
         &self,
         request: Request<VectorSearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        self.check_auth(request.metadata())?;
         let req = request.into_inner();
+        let collection_id = req.collection_id;
         println!("🔍 Vector search (top_k={}): {:?}", req.top_k, req.query_vector);
 
         // Fetch vectors from storage
-        let vectors = self.storage.get_all_vectors()
+        let vectors = self.storage.get_vectors_in_collection(&collection_id)
             .map_err(|e| Status::internal(format!("Storage retrieval error: {}", e)))?;
 
         // Build index dynamically (advanced indexing library)
@@ -123,7 +238,10 @@ impl AiDbService for AiDbServiceImpl {
         &self,
         request: Request<InsertDocRequest>,
     ) -> Result<Response<InsertResponse>, Status> {
+        self.check_auth(request.metadata())?;
         let req = request.into_inner();
+        let collection_id = req.collection_id;
+        if collection_id.is_empty() { return Err(Status::invalid_argument("Missing collection_id")); }
         println!("📥 InsertDoc (NoSQL/JSON) for ID: {}", req.id);
 
         // Parse flexible JSON metadata (NoSQL)
@@ -140,7 +258,7 @@ impl AiDbService for AiDbServiceImpl {
         };
 
         // Insert to multi-model storage layer
-        self.storage.insert_doc(doc)
+        self.storage.insert_doc(doc, &collection_id)
             .map_err(|e| Status::internal(format!("NoSQL/JSON insert error: {}", e)))?;
 
         Ok(Response::new(InsertResponse { success: true }))
@@ -152,11 +270,13 @@ impl AiDbService for AiDbServiceImpl {
         &self,
         request: Request<SqlRequest>,
     ) -> Result<Response<SqlResponse>, Status> {
+        self.check_auth(request.metadata())?;
         let req = request.into_inner();
+        let collection_id = req.collection_id;
         println!("🔍 SQL query on multi-model data: {}", req.sql);
 
         // Init DataFusion engine (projects Sled JSON to Arrow table)
-        let query_engine = QueryEngine::new(&self.storage).await
+        let query_engine = QueryEngine::new(std::sync::Arc::new(self.storage.clone()), &collection_id).await
             .map_err(|e| Status::internal(format!("DataFusion init error: {}", e)))?;
         let results = query_engine.execute_sql(&req.sql).await
             .map_err(|e| Status::internal(format!("SQL execution error: {}", e)))?;
@@ -179,11 +299,13 @@ impl AiDbService for AiDbServiceImpl {
         &self,
         request: Request<HybridRequest>,
     ) -> Result<Response<HybridResponse>, Status> {
+        self.check_auth(request.metadata())?;
         let req = request.into_inner();
+        let collection_id = req.collection_id;
         println!("🔍 HybridSearch: SQL='{}' + vector ANN (top_k={})", req.sql_filter, req.top_k);
 
         // Leverage hybrid planner (DataFusion SQL + HNSW + Sled NoSQL)
-        let query_engine = QueryEngine::new(&self.storage).await
+        let query_engine = QueryEngine::new(std::sync::Arc::new(self.storage.clone()), &collection_id).await
             .map_err(|e| Status::internal(format!("Planner error: {}", e)))?;
         let docs = query_engine.hybrid_query(&req.sql_filter, &req.query_vector, req.top_k as usize).await
             .map_err(|e| Status::internal(format!("Hybrid query error: {}", e)))?;

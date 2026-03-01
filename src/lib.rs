@@ -12,3 +12,5 @@ pub mod indexing;
 pub mod query;
 // REST API module: Axum HTTP handlers on port 11111 (mirrors gRPC for multi-model)
 pub mod rest;
+pub mod models;
+pub mod auth;

@@ -9,6 +9,7 @@ use sled::Db;
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
+use crate::models::{User, Tenant, Environment, Collection};
 
 /// Document struct for NoSQL/JSON support
 /// Enables schema-flexible storage in Sled (Serde-serialized).
@@ -33,6 +34,10 @@ pub struct Storage {
     metadata_tree: sled::Tree,
     vector_tree: sled::Tree,
     doc_tree: sled::Tree,  // For NoSQL/JSON docs
+    user_tree: sled::Tree,
+    tenant_tree: sled::Tree,
+    env_tree: sled::Tree,
+    collection_tree: sled::Tree,
     doc_cache: Arc<Mutex<DocCache>>, // In-memory cache for docs
 }
 
@@ -62,8 +67,9 @@ impl DocCache {
 
     fn get(&mut self, id: &str) -> Option<Document> {
         if let Some(entry) = self.entries.get(id) {
+            let doc_clone = entry.doc.clone();
             self.touch(id);
-            return Some(entry.doc.clone());
+            return Some(doc_clone);
         }
         None
     }
@@ -127,6 +133,10 @@ impl Storage {
         let metadata_tree = db.open_tree("metadata")?;
         let vector_tree = db.open_tree("vectors")?;
         let doc_tree = db.open_tree("docs")?;  // NoSQL JSON storage
+        let user_tree = db.open_tree("users")?;
+        let tenant_tree = db.open_tree("tenants")?;
+        let env_tree = db.open_tree("environments")?;
+        let collection_tree = db.open_tree("collections")?;
         let capacity_mb = read_cache_capacity_mb();
         let capacity_bytes = capacity_mb.saturating_mul(1024).saturating_mul(1024);
         Ok(Self {
@@ -134,8 +144,98 @@ impl Storage {
             metadata_tree,
             vector_tree,
             doc_tree,
+            user_tree,
+            tenant_tree,
+            env_tree,
+            collection_tree,
             doc_cache: Arc::new(Mutex::new(DocCache::new(capacity_bytes))),
         })
+    }
+
+    // User CRUD
+    pub fn create_user(&self, user: User) -> Result<(), Box<dyn std::error::Error>> {
+        let key = user.username.as_bytes();
+        if self.user_tree.contains_key(key)? {
+            return Err("User already exists".into());
+        }
+        let value = serde_json::to_vec(&user)?;
+        self.user_tree.insert(key, value)?;
+        Ok(())
+    }
+
+    pub fn get_user(&self, username: &str) -> Result<Option<User>, Box<dyn std::error::Error>> {
+        if let Some(value) = self.user_tree.get(username.as_bytes())? {
+            let user: User = serde_json::from_slice(&value)?;
+            Ok(Some(user))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_user(&self, user: User) -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::to_vec(&user)?;
+        self.user_tree.insert(user.username.as_bytes(), value)?;
+        Ok(())
+    }
+
+    // Tenant CRUD
+    pub fn create_tenant(&self, tenant: Tenant) -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::to_vec(&tenant)?;
+        self.tenant_tree.insert(tenant.id.as_bytes(), value)?;
+        Ok(())
+    }
+
+    pub fn get_tenant(&self, id: &str) -> Result<Option<Tenant>, Box<dyn std::error::Error>> {
+        if let Some(value) = self.tenant_tree.get(id.as_bytes())? {
+            let tenant: Tenant = serde_json::from_slice(&value)?;
+            Ok(Some(tenant))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_tenant(&self, tenant: Tenant) -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::to_vec(&tenant)?;
+        self.tenant_tree.insert(tenant.id.as_bytes(), value)?;
+        Ok(())
+    }
+
+    // Environment CRUD
+    pub fn create_environment(&self, env: Environment) -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::to_vec(&env)?;
+        self.env_tree.insert(env.id.as_bytes(), value)?;
+        Ok(())
+    }
+
+    pub fn get_environment(&self, id: &str) -> Result<Option<Environment>, Box<dyn std::error::Error>> {
+        if let Some(value) = self.env_tree.get(id.as_bytes())? {
+            let env: Environment = serde_json::from_slice(&value)?;
+            Ok(Some(env))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_environment(&self, env: Environment) -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::to_vec(&env)?;
+        self.env_tree.insert(env.id.as_bytes(), value)?;
+        Ok(())
+    }
+
+    // Collection CRUD
+    pub fn create_collection(&self, col: Collection) -> Result<(), Box<dyn std::error::Error>> {
+        let value = serde_json::to_vec(&col)?;
+        self.collection_tree.insert(col.id.as_bytes(), value)?;
+        Ok(())
+    }
+
+    pub fn get_collection(&self, id: &str) -> Result<Option<Collection>, Box<dyn std::error::Error>> {
+        if let Some(value) = self.collection_tree.get(id.as_bytes())? {
+            let col: Collection = serde_json::from_slice(&value)?;
+            Ok(Some(col))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Insert an Arrow RecordBatch (metadata) and a vector for a given ID
@@ -202,20 +302,21 @@ impl Storage {
     /// Insert a NoSQL Document (JSON via Serde) into unified Sled storage
     /// This provides schema-flexible document storage. Automatically syncs
     /// vector/metadata for indexing. Core to unified KV layer.
-    pub fn insert_doc(&self, doc: Document) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn insert_doc(&self, doc: Document, collection_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Serialize to JSON bytes for NoSQL storage in Sled
         let json_bytes = serde_json::to_vec(&doc)?;
+        let key = format!("{}/{}", collection_id, doc.id);
 
         // Store raw JSON doc (NoSQL)
-        self.doc_tree.insert(doc.id.as_bytes(), json_bytes)?;
+        self.doc_tree.insert(key.as_bytes(), json_bytes)?;
 
         // Sync to existing vector/Arrow for compatibility (hybrid link)
         let metadata_batch = create_metadata_batch(&doc.id, &doc.text)?;
-        self.insert(&doc.id, metadata_batch, doc.vector.clone())?;  // Reuses vector storage
+        self.insert(&key, metadata_batch, doc.vector.clone())?;  // Reuses vector storage
 
         // Update cache
         if let Ok(mut cache) = self.doc_cache.lock() {
-            cache.insert(doc.id.clone(), doc);
+            cache.insert(key, doc);
         }
 
         Ok(())
@@ -223,26 +324,27 @@ impl Storage {
 
     /// Retrieve NoSQL Document by ID (deserializes JSON from Sled)
     /// Enables dynamic/unstructured access.
-    pub fn get_doc(&self, id: &str) -> Result<Document, Box<dyn std::error::Error>> {
-        let (doc, _) = self.get_doc_with_cache_status(id)?;
+    pub fn get_doc(&self, collection_id: &str, id: &str) -> Result<Document, Box<dyn std::error::Error>> {
+        let key = format!("{}/{}", collection_id, id);
+        let (doc, _) = self.get_doc_with_cache_status(&key)?;
         Ok(doc)
     }
 
     /// Retrieve NoSQL Document by ID, returning if it was served from cache.
     pub fn get_doc_with_cache_status(
         &self,
-        id: &str,
+        key: &str,
     ) -> Result<(Document, bool), Box<dyn std::error::Error>> {
         if let Ok(mut cache) = self.doc_cache.lock() {
-            if let Some(doc) = cache.get(id) {
+            if let Some(doc) = cache.get(key) {
                 return Ok((doc, true));
             }
         }
 
-        if let Some(doc_bytes) = self.doc_tree.get(id.as_bytes())? {
+        if let Some(doc_bytes) = self.doc_tree.get(key.as_bytes())? {
             let doc: Document = serde_json::from_slice(&doc_bytes)?;
             if let Ok(mut cache) = self.doc_cache.lock() {
-                cache.insert(id.to_string(), doc.clone());
+                cache.insert(key.to_string(), doc.clone());
             }
             Ok((doc, false))
         } else {
@@ -256,14 +358,16 @@ impl Storage {
     /// Supports push-down filters for category, text, etc.
     /// Fixed schema: basic columns to ensure DataFusion table register/query success
     /// (vector stringified for hybrid; full List for prod).
-    pub fn project_to_arrow(&self) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    pub fn project_collection_to_arrow(&self, collection_id: &str) -> Result<RecordBatch, Box<dyn std::error::Error>> {
         let mut ids = vec![];
         let mut texts = vec![];
         let mut categories = vec![];
         let mut vector_strs = vec![];  // Stringify vectors for SQL compat
 
+        let prefix = format!("{}/", collection_id);
+
         // Scan NoSQL docs from Sled
-        for item in self.doc_tree.iter() {
+        for item in self.doc_tree.scan_prefix(prefix.as_bytes()) {
             let (_, value) = item?;
             let doc: Document = serde_json::from_slice(&value)?;
             ids.push(doc.id);
@@ -308,9 +412,10 @@ impl Storage {
     }
 
     /// Get all NoSQL docs (for hybrid planner/indexing)
-    pub fn get_all_docs(&self) -> Result<Vec<Document>, Box<dyn std::error::Error>> {
+    pub fn get_docs_in_collection(&self, collection_id: &str) -> Result<Vec<Document>, Box<dyn std::error::Error>> {
         let mut docs = vec![];
-        for item in self.doc_tree.iter() {
+        let prefix = format!("{}/", collection_id);
+        for item in self.doc_tree.scan_prefix(prefix.as_bytes()) {
             let (_, v) = item?;
             let doc: Document = serde_json::from_slice(&v)?;
             docs.push(doc);
@@ -323,42 +428,80 @@ impl Storage {
 
     /// Update NoSQL Document by ID (upsert JSON in Sled ; syncs metadata/vector)
     /// For edit capability in NoSQL layer.
-    pub fn update_doc(&self, doc: Document) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn update_doc(&self, doc: Document, collection_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Serialize updated JSON
         let json_bytes = serde_json::to_vec(&doc)?;
+        let key = format!("{}/{}", collection_id, doc.id);
 
         // Upsert in doc_tree (NoSQL)
-        self.doc_tree.insert(doc.id.as_bytes(), json_bytes)?;
+        self.doc_tree.insert(key.as_bytes(), json_bytes)?;
 
         // Sync to Arrow/metadata + vector trees for SQL/index consistency
         let metadata_batch = create_metadata_batch(&doc.id, &doc.text)?;
-        self.insert(&doc.id, metadata_batch, doc.vector.clone())?;
+        self.insert(&key, metadata_batch, doc.vector.clone())?;
 
         if let Ok(mut cache) = self.doc_cache.lock() {
-            cache.insert(doc.id.clone(), doc);
+            cache.insert(key, doc);
         }
 
         Ok(())
     }
 
     /// Delete by ID from NoSQL (JSON) + synced trees (for unified cleanup)
-    pub fn delete_doc(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.doc_tree.remove(id.as_bytes())?;
-        self.metadata_tree.remove(id.as_bytes())?;
-        self.vector_tree.remove(id.as_bytes())?;
+    pub fn delete_doc(&self, collection_id: &str, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let key = format!("{}/{}", collection_id, id);
+        self.doc_tree.remove(key.as_bytes())?;
+        self.metadata_tree.remove(key.as_bytes())?;
+        self.vector_tree.remove(key.as_bytes())?;
         if let Ok(mut cache) = self.doc_cache.lock() {
-            cache.remove(id);
+            cache.remove(&key);
         }
         // Note: For full SQL sync , re-project Arrow table post-delete in prod
         Ok(())
     }
 
+    /// Delete an entire collection and its documents
+    pub fn delete_collection(&self, env_id: &str, col_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Remove all docs in collection from doc_tree, metadata_tree, vector_tree
+        let prefix = format!("{}/", col_id);
+        for item in self.doc_tree.scan_prefix(prefix.as_bytes()) {
+            let (k, _) = item?;
+            self.doc_tree.remove(&k)?;
+            self.metadata_tree.remove(&k)?;
+            self.vector_tree.remove(&k)?;
+
+            // Cleanup cache if needed
+            if let Ok(k_str) = String::from_utf8(k.to_vec()) {
+                if let Ok(mut cache) = self.doc_cache.lock() {
+                    cache.remove(&k_str);
+                }
+            }
+        }
+
+        // 2. Remove collection metadata
+        self.collection_tree.remove(col_id.as_bytes())?;
+
+        // 3. Update environment to remove collection ID
+        if let Some(mut env) = self.get_environment(env_id)? {
+            env.collections.retain(|id| id != col_id);
+            self.update_environment(env)?;
+        }
+
+        Ok(())
+    }
+
     /// Get all vectors for indexing purposes (returns id and vector)
-    pub fn get_all_vectors(&self) -> Result<Vec<(String, Vec<f32>)>, Box<dyn std::error::Error>> {
+    pub fn get_vectors_in_collection(&self, collection_id: &str) -> Result<Vec<(String, Vec<f32>)>, Box<dyn std::error::Error>> {
         let mut vectors = Vec::new();
-        for item in self.vector_tree.iter() {
+        let prefix = format!("{}/", collection_id);
+        // Vectors are in vector_tree. The key is same as doc key: col_id/doc_id
+        for item in self.vector_tree.scan_prefix(prefix.as_bytes()) {
             let (k, v) = item?;
-            let id = String::from_utf8(k.to_vec())?;
+            let key_str = String::from_utf8(k.to_vec())?;
+            // Extract doc_id from key "col_id/doc_id"
+            let parts: Vec<&str> = key_str.split('/').collect();
+            let id = if parts.len() > 1 { parts[1].to_string() } else { key_str }; // fallback
+
             let vec_bytes = v.to_vec();
             let mut vector = Vec::new();
             for chunk in vec_bytes.chunks_exact(4) {

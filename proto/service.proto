@@ -7,6 +7,13 @@ package aidb;
 // Supports hybrid queries with predicate push-down for performance.
 
 service AiDbService {
+  // Auth & Management
+  rpc Register (RegisterRequest) returns (RegisterResponse);
+  rpc Login (LoginRequest) returns (LoginResponse);
+  rpc CreateTenant (CreateTenantRequest) returns (CreateTenantResponse);
+  rpc CreateEnvironment (CreateEnvironmentRequest) returns (CreateEnvironmentResponse);
+  rpc CreateCollection (CreateCollectionRequest) returns (CreateCollectionResponse);
+
   // Insert metadata (as Arrow internally) and vector into storage
   rpc Insert (InsertRequest) returns (InsertResponse);
   // Insert full NoSQL Document (JSON for unstructured/flexible schema)
@@ -23,10 +30,23 @@ service AiDbService {
   rpc HybridSearch (HybridRequest) returns (HybridResponse);
 }
 
+message RegisterRequest { string username = 1; string password = 2; }
+message RegisterResponse { bool success = 1; }
+message LoginRequest { string username = 1; string password = 2; }
+message LoginResponse { string token = 1; }
+
+message CreateTenantRequest { string id = 1; string name = 2; }
+message CreateTenantResponse { bool success = 1; }
+message CreateEnvironmentRequest { string tenant_id = 1; string id = 2; string name = 3; }
+message CreateEnvironmentResponse { bool success = 1; }
+message CreateCollectionRequest { string env_id = 1; string id = 2; string name = 3; }
+message CreateCollectionResponse { bool success = 1; }
+
 message InsertRequest {
   string id = 1;
   string text = 2;  // Metadata text, converted to Arrow RecordBatch
   repeated float vector = 3;  // Embedding vector stored in Sled
+  string collection_id = 4;
 }
 
 message InsertDocRequest {
@@ -35,6 +55,7 @@ message InsertDocRequest {
   string category = 3;  // For SQL filtering
   repeated float vector = 4;
   string metadata_json = 5;  // Flexible NoSQL JSON blob (Serde)
+  string collection_id = 6;
 }
 
 message InsertResponse {
@@ -43,15 +64,18 @@ message InsertResponse {
 
 message SearchRequest {
   string query = 1;
+  string collection_id = 2;
 }
 
 message VectorSearchRequest {
   repeated float query_vector = 1;  // Query embedding
   uint32 top_k = 2;  // Number of nearest neighbors
+  string collection_id = 3;
 }
 
 message SqlRequest {
   string sql = 1;  // SQL query on 'docs' table (DataFusion)
+  string collection_id = 2;
 }
 
 message SqlResponse {
@@ -63,6 +87,7 @@ message HybridRequest {
   string sql_filter = 1;  // SQL predicate (e.g., "category = 'AI'")
   repeated float query_vector = 2;  // For vector ANN
   uint32 top_k = 3;
+  string collection_id = 4;
 }
 
 message HybridResponse {
