@@ -5,6 +5,7 @@
 //!
 //! This lib exposes the core storage and indexing engine.
 
+pub mod cache;
 pub mod storage;
 pub mod indexing;
 // Query module for SQL engine (DataFusion) over NoSQL/Arrow projection
@@ -12,5 +13,5 @@ pub mod indexing;
 pub mod query;
 // REST API module: Axum HTTP handlers on port 11111 (mirrors gRPC for multi-model)
 pub mod rest;
-pub mod models;
+pub mod tenants;
 pub mod auth;

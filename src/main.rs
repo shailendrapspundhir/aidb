@@ -22,11 +22,10 @@ use tokio::net::TcpListener;  // For Axum bind in 0.7+
 // Enables multi-model: Storage (Sled/JSON), Indexing (HNSW), Query (DataFusion SQL)
 // + REST: Axum HTTP on port 11111 (concurrent with gRPC)
 use my_ai_db::storage::{Storage, Document};
-use my_ai_db::indexing::VectorIndex;
 use my_ai_db::query::QueryEngine;
 use my_ai_db::rest::create_router;  // REST router
 use serde_json;  // For JSON in NoSQL insert_doc RPC
-use my_ai_db::models::{User, Tenant, Environment, Collection, AuthPayload};
+use my_ai_db::tenants::{User, Tenant, Environment, Collection, AuthPayload};
 use my_ai_db::auth::{hash_password, verify_password, create_jwt, validate_jwt};
 
 // Include generated proto code (from tonic-build on aidb package)
@@ -217,16 +216,11 @@ impl AiDbService for AiDbServiceImpl {
         let collection_id = req.collection_id;
         println!("🔍 Vector search (top_k={}): {:?}", req.top_k, req.query_vector);
 
-        // Fetch vectors from storage
-        let vectors = self.storage.get_vectors_in_collection(&collection_id)
-            .map_err(|e| Status::internal(format!("Storage retrieval error: {}", e)))?;
-
-        // Build index dynamically (advanced indexing library)
-        let index = VectorIndex::build_from_vectors(vectors);
-
-        // Perform search, get matching IDs
         let top_k = req.top_k as usize;
-        let results = index.search(&req.query_vector, top_k);
+        let results = self
+            .storage
+            .vector_search(&collection_id, &req.query_vector, top_k)
+            .map_err(|e| Status::internal(format!("Storage retrieval error: {}", e)))?;
 
         println!("✅ Found {} results via index", results.len());
         Ok(Response::new(SearchResponse { results }))
@@ -276,7 +270,8 @@ impl AiDbService for AiDbServiceImpl {
         println!("🔍 SQL query on multi-model data: {}", req.sql);
 
         // Init DataFusion engine (projects Sled JSON to Arrow table)
-        let query_engine = QueryEngine::new(std::sync::Arc::new(self.storage.clone()), &collection_id).await
+        let query_engine = QueryEngine::new(std::sync::Arc::new(self.storage.clone()), &collection_id)
+            .await
             .map_err(|e| Status::internal(format!("DataFusion init error: {}", e)))?;
         let results = query_engine.execute_sql(&req.sql).await
             .map_err(|e| Status::internal(format!("SQL execution error: {}", e)))?;
@@ -305,7 +300,8 @@ impl AiDbService for AiDbServiceImpl {
         println!("🔍 HybridSearch: SQL='{}' + vector ANN (top_k={})", req.sql_filter, req.top_k);
 
         // Leverage hybrid planner (DataFusion SQL + HNSW + Sled NoSQL)
-        let query_engine = QueryEngine::new(std::sync::Arc::new(self.storage.clone()), &collection_id).await
+        let query_engine = QueryEngine::new(std::sync::Arc::new(self.storage.clone()), &collection_id)
+            .await
             .map_err(|e| Status::internal(format!("Planner error: {}", e)))?;
         let docs = query_engine.hybrid_query(&req.sql_filter, &req.query_vector, req.top_k as usize).await
             .map_err(|e| Status::internal(format!("Hybrid query error: {}", e)))?;

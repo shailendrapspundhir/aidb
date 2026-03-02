@@ -1,6 +1,6 @@
 use bcrypt::{hash, verify, DEFAULT_COST};
 use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey, Algorithm};
-use crate::models::AuthPayload;
+use crate::tenants::AuthPayload;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SECRET_KEY: &[u8] = b"my_super_secret_key"; // In prod, use env var

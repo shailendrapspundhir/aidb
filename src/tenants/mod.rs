@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod storage;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
     pub username: String,

@@ -8,7 +8,7 @@
 //! Enables hybrid queries (SQL + vector + JSON).
 
 use my_ai_db::storage::{Document, Storage};
-use my_ai_db::models::{User, Tenant, Environment, Collection};
+use my_ai_db::tenants::{User, Tenant, Environment, Collection};
 use my_ai_db::auth::hash_password;
 use my_ai_db::query::QueryEngine;
 use serde_json::json;
