@@ -36,4 +36,5 @@ pub struct Collection {
 pub struct AuthPayload {
     pub sub: String, // username
     pub exp: usize,
+    pub session_id: Option<String>, // Session ID for log tracking
 }

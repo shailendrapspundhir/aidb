@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use sled::Db;
 use std::sync::{Arc, Mutex};
+use tracing::{info, debug, warn, error, instrument};
 
 use crate::cache::DocCache;
 
@@ -51,7 +52,10 @@ impl Storage {
     /// Initializes unified trees for multi-model support:
     /// - Vectors/metadata for embeddings
     /// - Docs for NoSQL JSON (schema-flexible documents)
+    #[instrument(skip(path), fields(path))]
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        debug!(path = %path, "Opening storage");
+        
         let db = sled::open(path)?;
         let metadata_tree = db.open_tree("metadata")?;
         let vector_tree = db.open_tree("vectors")?;
@@ -62,6 +66,13 @@ impl Storage {
         let collection_tree = db.open_tree("collections")?;
         let capacity_mb = read_cache_capacity_mb();
         let capacity_bytes = capacity_mb.saturating_mul(1024).saturating_mul(1024);
+        
+        info!(
+            path = %path,
+            cache_capacity_mb = capacity_mb,
+            "Storage opened successfully"
+        );
+        
         Ok(Self {
             db,
             metadata_tree,

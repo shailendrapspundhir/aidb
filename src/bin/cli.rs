@@ -109,6 +109,7 @@ enum Commands {
 #[derive(Deserialize)]
 struct LoginResponse {
     token: String,
+    session_id: String,
 }
 
 #[tokio::main]
@@ -134,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Save token
                 fs::write(".aidb_token", body.token)?;
                 println!("Logged in. Token saved to .aidb_token");
+                println!("Session ID: {}", body.session_id);
             } else {
                 println!("Login failed: {}", res.text().await?);
             }

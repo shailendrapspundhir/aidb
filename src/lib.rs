@@ -15,3 +15,7 @@ pub mod query;
 pub mod rest;
 pub mod tenants;
 pub mod auth;
+// Logging module for JSON file logging
+pub mod logging;
+// Session management for tracking user sessions and logs
+pub mod session;

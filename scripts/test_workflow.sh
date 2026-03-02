@@ -3,7 +3,10 @@
 # Configuration
 URL="http://localhost:11111"
 CLI="cargo run --quiet --bin cli -- --url $URL"
+LOG_CLI="cargo run --quiet --bin aidb-cli --"
 SERVER_BIN="cargo run --quiet --bin my_ai_db"
+LOG_FILE_PATH="$(pwd)/logs/aidb.log.json"
+export AIDB_LOG_FILE="$LOG_FILE_PATH"
 
 echo "Starting my_ai_db server..."
 $SERVER_BIN &
@@ -22,7 +25,9 @@ echo "1. Registering user 'admin'..."
 run_cli register --username admin --password admin
 
 echo "2. Logging in..."
-run_cli login --username admin --password admin
+LOGIN_OUTPUT=$(run_cli login --username admin --password admin)
+echo "$LOGIN_OUTPUT"
+SESSION_ID=$(echo "$LOGIN_OUTPUT" | sed -n 's/^Session ID: //p')
 
 echo "3. Creating tenant 'tenant1'..."
 run_cli create-tenant --id tenant1 --name tenant1
@@ -69,7 +74,14 @@ done
 echo "9. Removing 'data' collection..."
 run_cli delete-collection -e dev --id data
 
-echo "10. Logging out..."
+if [ -z "$SESSION_ID" ]; then
+  echo "Session ID not found in login output; skipping log fetch."
+else
+  echo "10. Fetching logs for session: $SESSION_ID"
+  $LOG_CLI fetch-logs --session-id "$SESSION_ID"
+fi
+
+echo "11. Logging out..."
 run_cli logout
 
 echo "Stopping server (PID: $PID)..."

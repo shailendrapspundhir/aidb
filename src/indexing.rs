@@ -1,4 +1,5 @@
 use instant_distance::{Builder, HnswMap, Point, Search};
+use tracing::{info, debug, instrument};
 
 #[derive(Clone, Debug)]
 struct VectorPoint(Vec<f32>);
@@ -23,7 +24,10 @@ pub struct VectorIndex {
 
 impl VectorIndex {
     /// Build the index from a list of (id, vector) pairs obtained from storage
+    #[instrument(skip(vectors))]
     pub fn build_from_vectors(vectors: Vec<(String, Vec<f32>)>) -> Self {
+        debug!(vector_count = vectors.len(), "Building vector index");
+        
         let points: Vec<VectorPoint> = vectors
             .iter()
             .map(|(_, v)| VectorPoint(v.clone()))
@@ -31,20 +35,28 @@ impl VectorIndex {
         let values: Vec<String> = vectors.iter().map(|(id, _)| id.clone()).collect();
 
         let map = Builder::default().build(points, values);
+        
+        debug!(vector_count = vectors.len(), "Vector index built successfully");
         Self { map }
     }
 
     /// Search for k nearest neighbors by query vector, returns IDs
     /// This is the core indexing engine functionality
+    #[instrument(skip(self, query_vector))]
     pub fn search(&self, query_vector: &[f32], k: usize) -> Vec<String> {
+        debug!(k = k, vector_len = query_vector.len(), "Searching vector index");
+        
         let query_point = VectorPoint(query_vector.to_vec());
         let mut search_state = Search::default();
         // Search returns iterator of (PointId, &Value), sorted by distance
-        self.map
+        let results: Vec<String> = self.map
             .search(&query_point, &mut search_state)
             .take(k)
             .map(|item| item.value.clone())
-            .collect()
+            .collect();
+        
+        debug!(k = k, results_count = results.len(), "Vector search completed");
+        results
     }
 }
 

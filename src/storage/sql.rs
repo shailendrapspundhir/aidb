@@ -2,6 +2,7 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
+use tracing::{info, debug, warn, instrument};
 
 use crate::storage::{Document, Storage};
 
@@ -12,7 +13,10 @@ impl Storage {
     /// Supports push-down filters for category, text, etc.
     /// Fixed schema: basic columns to ensure DataFusion table register/query success
     /// (vector stringified for hybrid; full List for prod).
+    #[instrument(skip(self))]
     pub fn project_collection_to_arrow(&self, collection_id: &str) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+        debug!(collection_id = %collection_id, "Projecting collection to Arrow");
+        
         let mut ids = vec![];
         let mut texts = vec![];
         let mut categories = vec![];
@@ -33,6 +37,7 @@ impl Storage {
 
         if ids.is_empty() {
             // Empty batch fallback for SQL register (prevents query fail on no data)
+            debug!(collection_id = %collection_id, "No documents found, creating empty batch");
             ids.push("".to_string());
             texts.push("".to_string());
             categories.push("".to_string());
@@ -54,7 +59,7 @@ impl Storage {
         let cat_array = StringArray::from(categories);
         let vec_str_array = StringArray::from(vector_strs);
 
-        Ok(RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(id_array) as ArrayRef,
@@ -62,6 +67,9 @@ impl Storage {
                 Arc::new(cat_array) as ArrayRef,
                 Arc::new(vec_str_array) as ArrayRef,
             ],
-        )?)
+        )?;
+        
+        info!(collection_id = %collection_id, rows = batch.num_rows(), "Collection projected to Arrow");
+        Ok(batch)
     }
 }
