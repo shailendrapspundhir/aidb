@@ -28,6 +28,20 @@ service AiDbService {
   // Hybrid search: SQL filter + vector similarity (push-down optimized)
   // e.g., category filter on SQL + ANN for max perf without data movement
   rpc HybridSearch (HybridRequest) returns (HybridResponse);
+
+  // RAG System Operations
+  // Ingest text into RAG system (chunk, embed, store)
+  rpc RagIngest (RagIngestRequest) returns (RagIngestResponse);
+  // Search RAG documents using semantic similarity
+  rpc RagSearch (RagSearchRequest) returns (RagSearchResponse);
+  // Get RAG document chunks by document ID
+  rpc RagGetDoc (RagGetDocRequest) returns (RagGetDocResponse);
+  // Delete RAG document and all its chunks
+  rpc RagDeleteDoc (RagDeleteDocRequest) returns (RagDeleteDocResponse);
+  // List all RAG document IDs in a collection
+  rpc RagListDocs (RagListDocsRequest) returns (RagListDocsResponse);
+  // Generate embedding for text
+  rpc RagEmbed (RagEmbedRequest) returns (RagEmbedResponse);
 }
 
 message RegisterRequest { string username = 1; string password = 2; }
@@ -101,4 +115,106 @@ message HybridResponse {
 
 message SearchResponse {
   repeated string results = 1;  // IDs of matching documents
+}
+
+// === RAG System Messages ===
+
+// Request to ingest text into RAG system
+message RagIngestRequest {
+  string doc_id = 1;           // Unique document identifier
+  string text = 2;             // Text content to ingest
+  string collection_id = 3;    // Collection to store in
+  string metadata_json = 4;    // Optional metadata as JSON
+  string source = 5;           // Optional source identifier (e.g., file path, URL)
+}
+
+// Response for RAG ingestion
+message RagIngestResponse {
+  bool success = 1;
+  string message = 2;
+  string doc_id = 3;
+  uint32 chunks_created = 4;
+}
+
+// Request to search RAG documents
+message RagSearchRequest {
+  string query = 1;            // Search query text
+  string collection_id = 2;    // Collection to search in
+  uint32 top_k = 3;            // Number of results to return
+}
+
+// Single result item in RAG search
+message RagResultItem {
+  string chunk_id = 1;
+  string doc_id = 2;
+  string text = 3;
+  float score = 4;
+  string metadata_json = 5;
+}
+
+// Response for RAG search
+message RagSearchResponse {
+  bool success = 1;
+  string message = 2;
+  repeated RagResultItem results = 3;
+}
+
+// Request to get RAG document chunks
+message RagGetDocRequest {
+  string collection_id = 1;
+  string doc_id = 2;
+}
+
+// RAG document chunk
+message RagChunk {
+  string id = 1;
+  string doc_id = 2;
+  string text = 3;
+  repeated float embedding = 4;
+  uint32 chunk_index = 5;
+  uint32 total_chunks = 6;
+  string source = 7;
+  string created_at = 8;
+  string metadata_json = 9;
+}
+
+// Response for getting RAG document
+message RagGetDocResponse {
+  bool success = 1;
+  repeated RagChunk chunks = 2;
+}
+
+// Request to delete RAG document
+message RagDeleteDocRequest {
+  string collection_id = 1;
+  string doc_id = 2;
+}
+
+// Response for deleting RAG document
+message RagDeleteDocResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Request to list RAG documents
+message RagListDocsRequest {
+  string collection_id = 1;
+}
+
+// Response for listing RAG documents
+message RagListDocsResponse {
+  bool success = 1;
+  repeated string doc_ids = 2;
+}
+
+// Request to generate embedding
+message RagEmbedRequest {
+  string text = 1;
+}
+
+// Response for embedding generation
+message RagEmbedResponse {
+  bool success = 1;
+  repeated float embedding = 2;
+  uint32 dimension = 3;
 }

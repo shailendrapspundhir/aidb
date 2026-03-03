@@ -112,6 +112,12 @@ pub fn create_router(storage: Storage) -> Router {
         .route("/collections/:collection_id/docs/:doc_id", get(get_doc_handler).delete(delete_doc_handler))
         .route("/collections/:collection_id/sql", post(sql_handler))
         .route("/collections/:collection_id/hybrid", post(hybrid_handler))
+        // RAG System endpoints
+        .route("/collections/:collection_id/rag/ingest", post(rag_ingest_handler))
+        .route("/collections/:collection_id/rag/search", post(rag_search_handler))
+        .route("/collections/:collection_id/rag/docs", get(rag_list_docs_handler))
+        .route("/collections/:collection_id/rag/docs/:doc_id", get(rag_get_doc_handler).delete(rag_delete_doc_handler))
+        .route("/rag/embed", post(rag_embed_handler))
         // Session and logs endpoints
         .route("/sessions", get(get_sessions_handler))
         .route("/sessions/:session_id", get(get_session_handler))
@@ -731,6 +737,332 @@ async fn get_session_logs_by_level_handler(
         warn!(session_id = %session_id, "Session not found for logs");
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+// === RAG System REST Handlers ===
+
+/// DTO for RAG text ingestion
+#[derive(Deserialize)]
+pub struct RagIngestRequest {
+    /// Document ID
+    pub doc_id: String,
+    /// Text content to ingest
+    pub text: String,
+    /// Optional metadata as JSON string
+    pub metadata_json: Option<String>,
+    /// Optional source identifier
+    pub source: Option<String>,
+}
+
+/// DTO for RAG search request
+#[derive(Deserialize)]
+pub struct RagSearchRequest {
+    /// Search query text
+    pub query: String,
+    /// Number of results to return
+    pub top_k: usize,
+}
+
+/// Response for RAG search
+#[derive(Serialize)]
+pub struct RagSearchResponse {
+    pub success: bool,
+    pub message: String,
+    pub results: Vec<RagResultItem>,
+}
+
+/// Single result item in RAG search
+#[derive(Serialize)]
+pub struct RagResultItem {
+    pub chunk_id: String,
+    pub doc_id: String,
+    pub text: String,
+    pub score: f32,
+    pub metadata: serde_json::Value,
+}
+
+/// Response for RAG ingestion
+#[derive(Serialize)]
+pub struct RagIngestResponse {
+    pub success: bool,
+    pub message: String,
+    pub doc_id: String,
+    pub chunks_created: usize,
+}
+
+/// Handler: Ingest text into RAG system
+/// POST /collections/:collection_id/rag/ingest
+#[instrument(skip(state, payload))]
+pub async fn rag_ingest_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthPayload>,
+    Path(collection_id): Path<String>,
+    Json(payload): Json<RagIngestRequest>,
+) -> Result<Json<RagIngestResponse>, StatusCode> {
+    debug!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        doc_id = %payload.doc_id,
+        text_len = payload.text.len(),
+        "RAG ingest request"
+    );
+    
+    // Parse metadata
+    let metadata = payload.metadata_json
+        .and_then(|m| serde_json::from_str(&m).ok())
+        .unwrap_or(serde_json::json!({}));
+    
+    // Create RAG pipeline with simple embedder
+    let pipeline = crate::rag::RagPipeline::simple()
+        .map_err(|e| {
+            error!(error = %e, "Failed to create RAG pipeline");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    // Ingest text
+    let chunks = pipeline.ingest_text(
+        &state.storage,
+        &payload.text,
+        &payload.doc_id,
+        &collection_id,
+        Some(metadata),
+        payload.source,
+    ).await.map_err(|e| {
+        error!(error = %e, collection_id = %collection_id, doc_id = %payload.doc_id, "RAG ingestion failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    
+    info!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        doc_id = %payload.doc_id,
+        chunks_created = chunks.len(),
+        "RAG ingestion completed"
+    );
+    
+    Ok(Json(RagIngestResponse {
+        success: true,
+        message: format!("Ingested {} chunks", chunks.len()),
+        doc_id: payload.doc_id,
+        chunks_created: chunks.len(),
+    }))
+}
+
+/// Handler: Search RAG documents
+/// POST /collections/:collection_id/rag/search
+#[instrument(skip(state, payload))]
+pub async fn rag_search_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthPayload>,
+    Path(collection_id): Path<String>,
+    Json(payload): Json<RagSearchRequest>,
+) -> Result<Json<RagSearchResponse>, StatusCode> {
+    debug!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        query_len = payload.query.len(),
+        top_k = payload.top_k,
+        "RAG search request"
+    );
+    
+    // Create RAG pipeline
+    let pipeline = crate::rag::RagPipeline::simple()
+        .map_err(|e| {
+            error!(error = %e, "Failed to create RAG pipeline");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    // Perform search
+    let results = pipeline.search(
+        &state.storage,
+        &collection_id,
+        &payload.query,
+        payload.top_k,
+    ).await.map_err(|e| {
+        error!(error = %e, collection_id = %collection_id, "RAG search failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    
+    // Convert results
+    let result_items: Vec<RagResultItem> = results
+        .into_iter()
+        .map(|r| {
+            let chunk_id = r.chunk.id;
+            let doc_id = chunk_id
+                .split('-')
+                .next()
+                .unwrap_or(chunk_id.as_str())
+                .to_string();
+            RagResultItem {
+                chunk_id,
+                doc_id,
+                text: r.chunk.text,
+                score: r.score,
+                metadata: r.chunk.metadata,
+            }
+        })
+        .collect();
+    
+    info!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        results_count = result_items.len(),
+        "RAG search completed"
+    );
+    
+    Ok(Json(RagSearchResponse {
+        success: true,
+        message: format!("Found {} results", result_items.len()),
+        results: result_items,
+    }))
+}
+
+/// Handler: Get RAG document chunks
+/// GET /collections/:collection_id/rag/docs/:doc_id
+pub async fn rag_get_doc_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthPayload>,
+    Path((collection_id, doc_id)): Path<(String, String)>,
+) -> Result<Json<Vec<crate::storage::RagStorageDocument>>, StatusCode> {
+    debug!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        doc_id = %doc_id,
+        "RAG get document request"
+    );
+    
+    let chunks = state.storage.get_rag_doc_chunks(&collection_id, &doc_id)
+        .map_err(|e| {
+            warn!(error = %e, collection_id = %collection_id, doc_id = %doc_id, "Document not found");
+            StatusCode::NOT_FOUND
+        })?;
+    
+    info!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        doc_id = %doc_id,
+        chunks = chunks.len(),
+        "RAG document retrieved"
+    );
+    
+    Ok(Json(chunks))
+}
+
+/// Handler: Delete RAG document
+/// DELETE /collections/:collection_id/rag/docs/:doc_id
+pub async fn rag_delete_doc_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthPayload>,
+    Path((collection_id, doc_id)): Path<(String, String)>,
+) -> Result<Json<RestResponse>, StatusCode> {
+    debug!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        doc_id = %doc_id,
+        "RAG delete document request"
+    );
+    
+    state.storage.delete_rag_doc(&collection_id, &doc_id)
+        .map_err(|e| {
+            error!(error = %e, collection_id = %collection_id, doc_id = %doc_id, "Failed to delete RAG document");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    info!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        doc_id = %doc_id,
+        "RAG document deleted"
+    );
+    
+    Ok(Json(RestResponse {
+        success: true,
+        message: format!("RAG document {} deleted", doc_id),
+        results: vec![],
+        cache_hits: None,
+    }))
+}
+
+/// Handler: List all RAG documents in collection
+/// GET /collections/:collection_id/rag/docs
+pub async fn rag_list_docs_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<AuthPayload>,
+    Path(collection_id): Path<String>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    debug!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        "RAG list documents request"
+    );
+    
+    let doc_ids = state.storage.get_rag_doc_ids(&collection_id)
+        .map_err(|e| {
+            error!(error = %e, collection_id = %collection_id, "Failed to list RAG documents");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    info!(
+        username = %claims.sub,
+        collection_id = %collection_id,
+        doc_count = doc_ids.len(),
+        "RAG documents listed"
+    );
+    
+    Ok(Json(doc_ids))
+}
+
+/// Handler: Generate embedding for text
+/// POST /rag/embed
+pub async fn rag_embed_handler(
+    Extension(claims): Extension<AuthPayload>,
+    Json(payload): Json<RagEmbedRequest>,
+) -> Result<Json<RagEmbedResponse>, StatusCode> {
+    debug!(
+        username = %claims.sub,
+        text_len = payload.text.len(),
+        "RAG embed request"
+    );
+    
+    // Create RAG pipeline
+    let pipeline = crate::rag::RagPipeline::simple()
+        .map_err(|e| {
+            error!(error = %e, "Failed to create RAG pipeline");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    // Generate embedding
+    let embedding = pipeline.embed(&payload.text)
+        .map_err(|e| {
+            error!(error = %e, "Failed to generate embedding");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    
+    info!(
+        username = %claims.sub,
+        embedding_dim = embedding.len(),
+        "Embedding generated"
+    );
+    
+    Ok(Json(RagEmbedResponse {
+        success: true,
+        embedding,
+        dimension: pipeline.embedding_dim(),
+    }))
+}
+
+/// DTO for embedding request
+#[derive(Deserialize)]
+pub struct RagEmbedRequest {
+    pub text: String,
+}
+
+/// Response for embedding
+#[derive(Serialize)]
+pub struct RagEmbedResponse {
+    pub success: bool,
+    pub embedding: Vec<f32>,
+    pub dimension: usize,
 }
 
 #[cfg(test)]

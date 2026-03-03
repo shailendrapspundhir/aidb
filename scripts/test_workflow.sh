@@ -35,10 +35,11 @@ run_cli create-tenant --id tenant1 --name tenant1
 echo "4. Creating environment 'dev'..."
 run_cli create-env -t tenant1 --id dev --name dev
 
-echo "5. Creating collections: users, addresses, data..."
+echo "5. Creating collections: users, addresses, data, rag..."
 run_cli create-collection -e dev --id users --name users
 run_cli create-collection -e dev --id addresses --name addresses
 run_cli create-collection -e dev --id data --name data
+run_cli create-collection -e dev --id rag --name rag
 
 echo "6. Storing 10 documents in each collection..."
 for i in {1..10}; do
@@ -53,7 +54,23 @@ for i in {1..10}; do
     -m "{\"value\":$((i*10)),\"unit\":\"ms\",\"timestamp\":\"2026-03-01\",\"node\":\"node-$i\",\"priority\":\"high\"}"
 done
 
-echo "7. Fetching stored data..."
+echo "7. Ingesting RAG text examples (embeddings stored in DB)..."
+run_cli rag-ingest -C rag --doc-id rag-doc-1 --text "Rust is a systems programming language focused on safety and speed." \
+  --metadata-json "{\"topic\":\"rust\",\"source\":\"docs\"}" --source "docs"
+run_cli rag-ingest -C rag --doc-id rag-doc-2 --text "Vector search uses embeddings to compare semantic similarity between chunks." \
+  --metadata-json "{\"topic\":\"vector-search\"}" --source "notes"
+
+RAG_TEXT_FILE="$(pwd)/scripts/rag_sample.txt"
+cat <<EOF > "$RAG_TEXT_FILE"
+Retrieval-augmented generation combines search with generation.
+Chunking text helps match relevant passages.
+Embeddings represent text as vectors.
+EOF
+run_cli rag-ingest-file -C rag --doc-id rag-doc-file --path "$RAG_TEXT_FILE" \
+  --metadata-json "{\"topic\":\"rag\",\"source\":\"file\"}"
+
+
+echo "8. Fetching stored data..."
 echo "--- Bulk fetch users ---"
 run_cli list-docs -C users
 echo "--- Bulk fetch addresses ---"
@@ -64,24 +81,28 @@ run_cli list-docs -C data
 echo "--- Individual fetch user1 ---"
 run_cli get-doc -C users --id user1
 
-echo "8. Deleting 5 documents from each collection..."
+echo "9. Searching RAG embeddings..."
+run_cli rag-search -C rag --query "How does vector search compare embeddings?" --top-k 5
+
+
+echo "10. Deleting 5 documents from each collection..."
 for i in {1..5}; do
   run_cli delete-doc -C users --id user$i
   run_cli delete-doc -C addresses --id addr$i
   run_cli delete-doc -C data --id item$i
 done
 
-echo "9. Removing 'data' collection..."
+echo "11. Removing 'data' collection..."
 run_cli delete-collection -e dev --id data
 
 if [ -z "$SESSION_ID" ]; then
   echo "Session ID not found in login output; skipping log fetch."
 else
-  echo "10. Fetching logs for session: $SESSION_ID"
+  echo "12. Fetching logs for session: $SESSION_ID"
   $LOG_CLI fetch-logs --session-id "$SESSION_ID"
 fi
 
-echo "11. Logging out..."
+echo "13. Logging out..."
 run_cli logout
 
 echo "Stopping server (PID: $PID)..."

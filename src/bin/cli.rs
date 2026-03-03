@@ -103,6 +103,38 @@ enum Commands {
         #[arg(short, long)]
         query: String,
     },
+    RagIngest {
+        #[arg(short = 'C', long = "collection")]
+        collection_id: String,
+        #[arg(short, long)]
+        doc_id: String,
+        #[arg(short, long)]
+        text: String,
+        #[arg(short = 'm', long)]
+        metadata_json: Option<String>,
+        #[arg(short, long)]
+        source: Option<String>,
+    },
+    RagIngestFile {
+        #[arg(short = 'C', long = "collection")]
+        collection_id: String,
+        #[arg(short, long)]
+        doc_id: String,
+        #[arg(short, long)]
+        path: String,
+        #[arg(short = 'm', long)]
+        metadata_json: Option<String>,
+        #[arg(short, long)]
+        source: Option<String>,
+    },
+    RagSearch {
+        #[arg(short = 'C', long = "collection")]
+        collection_id: String,
+        #[arg(short, long)]
+        query: String,
+        #[arg(short, long, default_value_t = 5)]
+        top_k: usize,
+    },
     Logout,
 }
 
@@ -234,6 +266,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let res = client.post(format!("{}/collections/{}/sql", cli.url, collection_id))
                 .header("Authorization", format!("Bearer {}", token))
                 .json(&json!({ "sql": query }))
+                .send()
+                .await?;
+            println!("Response: {}", res.text().await?);
+        }
+        Commands::RagIngest {
+            collection_id,
+            doc_id,
+            text,
+            metadata_json,
+            source,
+        } => {
+            let token = fs::read_to_string(".aidb_token").unwrap_or_default();
+            let res = client.post(format!("{}/collections/{}/rag/ingest", cli.url, collection_id))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&json!({
+                    "doc_id": doc_id,
+                    "text": text,
+                    "metadata_json": metadata_json,
+                    "source": source,
+                }))
+                .send()
+                .await?;
+            println!("Response: {}", res.text().await?);
+        }
+        Commands::RagIngestFile {
+            collection_id,
+            doc_id,
+            path,
+            metadata_json,
+            source,
+        } => {
+            let token = fs::read_to_string(".aidb_token").unwrap_or_default();
+            let text = fs::read_to_string(&path)?;
+            let res = client.post(format!("{}/collections/{}/rag/ingest", cli.url, collection_id))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&json!({
+                    "doc_id": doc_id,
+                    "text": text,
+                    "metadata_json": metadata_json,
+                    "source": source.or(Some(path)),
+                }))
+                .send()
+                .await?;
+            println!("Response: {}", res.text().await?);
+        }
+        Commands::RagSearch {
+            collection_id,
+            query,
+            top_k,
+        } => {
+            let token = fs::read_to_string(".aidb_token").unwrap_or_default();
+            let res = client.post(format!("{}/collections/{}/rag/search", cli.url, collection_id))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&json!({ "query": query, "top_k": top_k }))
                 .send()
                 .await?;
             println!("Response: {}", res.text().await?);

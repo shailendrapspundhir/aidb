@@ -164,3 +164,218 @@ impl Storage {
         Ok(())
     }
 }
+
+// === RAG-specific storage methods ===
+
+/// RAG-specific document stored in the database
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct RagStorageDocument {
+    /// Unique identifier
+    pub id: String,
+    /// Original document ID (for chunk grouping)
+    pub doc_id: String,
+    /// Text content
+    pub text: String,
+    /// Vector embedding
+    pub embedding: Vec<f32>,
+    /// Chunk index
+    pub chunk_index: usize,
+    /// Total chunks in document
+    pub total_chunks: usize,
+    /// Source identifier
+    pub source: Option<String>,
+    /// Creation timestamp
+    pub created_at: String,
+    /// Custom metadata
+    pub metadata: serde_json::Value,
+}
+
+impl Storage {
+    /// Insert a RAG document chunk
+    #[instrument(skip(self, doc), fields(id = %doc.id, collection_id))]
+    pub fn insert_rag_doc(
+        &self,
+        doc: &RagStorageDocument,
+        collection_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        debug!(id = %doc.id, collection_id = %collection_id, "Inserting RAG document");
+        
+        // Serialize to JSON
+        let json_bytes = serde_json::to_vec(doc)?;
+        let key = format!("{}/{}", collection_id, doc.id);
+        
+        // Store in RAG tree
+        self.rag_tree.insert(key.as_bytes(), json_bytes)?;
+        
+        // Also store in doc_tree and vector_tree for compatibility with existing search
+        let storage_doc = Document {
+            id: doc.id.clone(),
+            text: doc.text.clone(),
+            category: "rag".to_string(),
+            vector: doc.embedding.clone(),
+            metadata: serde_json::json!({
+                "doc_id": doc.doc_id,
+                "chunk_index": doc.chunk_index,
+                "total_chunks": doc.total_chunks,
+                "source": doc.source,
+                "created_at": doc.created_at,
+                "custom": doc.metadata,
+            }),
+        };
+        self.insert_doc(storage_doc, collection_id)?;
+        
+        info!(id = %doc.id, collection_id = %collection_id, "RAG document inserted");
+        Ok(())
+    }
+
+    /// Get a RAG document by ID
+    #[instrument(skip(self), fields(collection_id, doc_id))]
+    pub fn get_rag_doc(
+        &self,
+        collection_id: &str,
+        doc_id: &str,
+    ) -> Result<RagStorageDocument, Box<dyn std::error::Error>> {
+        debug!(collection_id = %collection_id, doc_id = %doc_id, "Getting RAG document");
+        
+        let key = format!("{}/{}", collection_id, doc_id);
+        
+        if let Some(doc_bytes) = self.rag_tree.get(key.as_bytes())? {
+            let doc: RagStorageDocument = serde_json::from_slice(&doc_bytes)?;
+            Ok(doc)
+        } else {
+            warn!(key = %key, "RAG document not found");
+            Err("RAG document not found".into())
+        }
+    }
+
+    /// Get all chunks for a document
+    #[instrument(skip(self), fields(collection_id, doc_id))]
+    pub fn get_rag_doc_chunks(
+        &self,
+        collection_id: &str,
+        doc_id: &str,
+    ) -> Result<Vec<RagStorageDocument>, Box<dyn std::error::Error>> {
+        debug!(collection_id = %collection_id, doc_id = %doc_id, "Getting RAG document chunks");
+        
+        let prefix = format!("{}/{}-", collection_id, doc_id);
+        let mut chunks = Vec::new();
+        
+        for item in self.rag_tree.scan_prefix(prefix.as_bytes()) {
+            let (_, v) = item?;
+            let doc: RagStorageDocument = serde_json::from_slice(&v)?;
+            chunks.push(doc);
+        }
+        
+        // Also check for single-chunk document
+        let single_key = format!("{}/{}", collection_id, doc_id);
+        if let Some(doc_bytes) = self.rag_tree.get(single_key.as_bytes())? {
+            let doc: RagStorageDocument = serde_json::from_slice(&doc_bytes)?;
+            if !chunks.contains(&doc) {
+                chunks.push(doc);
+            }
+        }
+        
+        // Sort by chunk index
+        chunks.sort_by_key(|d| d.chunk_index);
+        
+        info!(collection_id = %collection_id, doc_id = %doc_id, chunks = chunks.len(), "RAG chunks retrieved");
+        Ok(chunks)
+    }
+
+    /// Delete all chunks for a RAG document
+    #[instrument(skip(self), fields(collection_id, doc_id))]
+    pub fn delete_rag_doc(
+        &self,
+        collection_id: &str,
+        doc_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        debug!(collection_id = %collection_id, doc_id = %doc_id, "Deleting RAG document");
+        
+        // Get all chunks first
+        let chunks = self.get_rag_doc_chunks(collection_id, doc_id)?;
+        
+        let deleted_count = chunks.len();
+
+        // Delete each chunk
+        for chunk in chunks {
+            let key = format!("{}/{}", collection_id, chunk.id);
+            self.rag_tree.remove(key.as_bytes())?;
+            
+            // Also delete from doc_tree and vector_tree
+            self.doc_tree.remove(key.as_bytes())?;
+            self.metadata_tree.remove(key.as_bytes())?;
+            self.vector_tree.remove(key.as_bytes())?;
+            
+            // Remove from cache
+            if let Ok(mut cache) = self.doc_cache.lock() {
+                cache.remove(&key);
+            }
+        }
+        
+        info!(collection_id = %collection_id, doc_id = %doc_id, chunks_deleted = deleted_count, "RAG document deleted");
+        Ok(())
+    }
+
+    /// Get all RAG documents in a collection
+    #[instrument(skip(self), fields(collection_id))]
+    pub fn get_rag_docs_in_collection(
+        &self,
+        collection_id: &str,
+    ) -> Result<Vec<RagStorageDocument>, Box<dyn std::error::Error>> {
+        debug!(collection_id = %collection_id, "Getting all RAG documents in collection");
+        
+        let prefix = format!("{}/", collection_id);
+        let mut docs = Vec::new();
+        
+        for item in self.rag_tree.scan_prefix(prefix.as_bytes()) {
+            let (_, v) = item?;
+            let doc: RagStorageDocument = serde_json::from_slice(&v)?;
+            docs.push(doc);
+        }
+        
+        info!(collection_id = %collection_id, docs = docs.len(), "RAG documents retrieved");
+        Ok(docs)
+    }
+
+    /// Get unique document IDs in a RAG collection
+    #[instrument(skip(self), fields(collection_id))]
+    pub fn get_rag_doc_ids(
+        &self,
+        collection_id: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        debug!(collection_id = %collection_id, "Getting unique RAG document IDs");
+        
+        let docs = self.get_rag_docs_in_collection(collection_id)?;
+        let mut unique_ids = std::collections::HashSet::new();
+        
+        for doc in docs {
+            unique_ids.insert(doc.doc_id);
+        }
+        
+        let ids: Vec<String> = unique_ids.into_iter().collect();
+        info!(collection_id = %collection_id, unique_docs = ids.len(), "Unique RAG document IDs retrieved");
+        Ok(ids)
+    }
+
+    /// Update a RAG document (delete old chunks, insert new ones)
+    #[instrument(skip(self, chunks), fields(collection_id, doc_id))]
+    pub fn update_rag_doc(
+        &self,
+        collection_id: &str,
+        doc_id: &str,
+        chunks: Vec<RagStorageDocument>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        debug!(collection_id = %collection_id, doc_id = %doc_id, new_chunks = chunks.len(), "Updating RAG document");
+        
+        // Delete existing chunks
+        self.delete_rag_doc(collection_id, doc_id)?;
+        
+        // Insert new chunks
+        for chunk in chunks {
+            self.insert_rag_doc(&chunk, collection_id)?;
+        }
+        
+        info!(collection_id = %collection_id, doc_id = %doc_id, "RAG document updated");
+        Ok(())
+    }
+}

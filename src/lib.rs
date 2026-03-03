@@ -19,3 +19,5 @@ pub mod auth;
 pub mod logging;
 // Session management for tracking user sessions and logs
 pub mod session;
+// RAG System modules
+pub mod rag;

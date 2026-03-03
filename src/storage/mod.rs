@@ -11,6 +11,7 @@ pub mod sql;
 pub mod vector;
 
 pub use vector::create_metadata_batch;
+pub use nosql::RagStorageDocument;
 
 /// Document struct for NoSQL/JSON support
 /// Enables schema-flexible storage in Sled (Serde-serialized).
@@ -39,6 +40,7 @@ pub struct Storage {
     pub(crate) tenant_tree: sled::Tree,
     pub(crate) env_tree: sled::Tree,
     pub(crate) collection_tree: sled::Tree,
+    pub(crate) rag_tree: sled::Tree,  // For RAG documents and chunks
     pub(crate) doc_cache: Arc<Mutex<DocCache>>, // In-memory cache for docs
 }
 
@@ -52,6 +54,7 @@ impl Storage {
     /// Initializes unified trees for multi-model support:
     /// - Vectors/metadata for embeddings
     /// - Docs for NoSQL JSON (schema-flexible documents)
+    /// - RAG tree for RAG documents and chunks
     #[instrument(skip(path), fields(path))]
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         debug!(path = %path, "Opening storage");
@@ -64,6 +67,7 @@ impl Storage {
         let tenant_tree = db.open_tree("tenants")?;
         let env_tree = db.open_tree("environments")?;
         let collection_tree = db.open_tree("collections")?;
+        let rag_tree = db.open_tree("rag")?;  // RAG documents and chunks
         let capacity_mb = read_cache_capacity_mb();
         let capacity_bytes = capacity_mb.saturating_mul(1024).saturating_mul(1024);
         
@@ -82,6 +86,7 @@ impl Storage {
             tenant_tree,
             env_tree,
             collection_tree,
+            rag_tree,
             doc_cache: Arc::new(Mutex::new(DocCache::new(capacity_bytes))),
         })
     }

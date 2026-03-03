@@ -42,6 +42,11 @@ use aidb::{
     RegisterRequest, RegisterResponse, LoginRequest, LoginResponse,
     CreateTenantRequest, CreateTenantResponse, CreateEnvironmentRequest, CreateEnvironmentResponse,
     CreateCollectionRequest, CreateCollectionResponse,
+    // RAG System messages
+    RagIngestRequest, RagIngestResponse, RagSearchRequest, RagSearchResponse,
+    RagGetDocRequest, RagGetDocResponse, RagDeleteDocRequest, RagDeleteDocResponse,
+    RagListDocsRequest, RagListDocsResponse, RagEmbedRequest, RagEmbedResponse,
+    RagResultItem, RagChunk,
 };
 
 /// Service implementation for AiDbService
@@ -413,6 +418,262 @@ impl AiDbService for AiDbServiceImpl {
 
         info!(collection_id = %collection_id, results_count = results.len(), cache_hits = ?cache_hits, "Hybrid search completed");
         Ok(Response::new(HybridResponse { results, cache_hits }))
+    }
+
+    // === RAG System gRPC Methods ===
+
+    /// RagIngest: Ingest text into RAG system
+    /// Chunks text, generates embeddings, and stores in database
+    #[instrument(skip(self, request), fields(collection_id, doc_id))]
+    async fn rag_ingest(
+        &self,
+        request: Request<RagIngestRequest>,
+    ) -> Result<Response<RagIngestResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        
+        info!(
+            collection_id = %req.collection_id,
+            doc_id = %req.doc_id,
+            text_len = req.text.len(),
+            "RAG ingest request"
+        );
+        
+        // Parse metadata
+        let metadata: serde_json::Value = serde_json::from_str(&req.metadata_json)
+            .unwrap_or(serde_json::json!({}));
+        
+        // Create RAG pipeline
+        let pipeline = my_ai_db::rag::RagPipeline::simple()
+            .map_err(|e| {
+                error!(error = %e, "Failed to create RAG pipeline");
+                Status::internal(format!("RAG pipeline error: {}", e))
+            })?;
+        
+        // Ingest text
+        let chunks = pipeline.ingest_text(
+            &self.storage,
+            &req.text,
+            &req.doc_id,
+            &req.collection_id,
+            Some(metadata),
+            if req.source.is_empty() { None } else { Some(req.source.clone()) },
+        ).await.map_err(|e| {
+            error!(error = %e, collection_id = %req.collection_id, doc_id = %req.doc_id, "RAG ingestion failed");
+            Status::internal(format!("RAG ingestion error: {}", e))
+        })?;
+        
+        info!(
+            collection_id = %req.collection_id,
+            doc_id = %req.doc_id,
+            chunks_created = chunks.len(),
+            "RAG ingestion completed"
+        );
+        
+        Ok(Response::new(RagIngestResponse {
+            success: true,
+            message: format!("Ingested {} chunks", chunks.len()),
+            doc_id: req.doc_id,
+            chunks_created: chunks.len() as u32,
+        }))
+    }
+
+    /// RagSearch: Search RAG documents using semantic similarity
+    #[instrument(skip(self, request), fields(collection_id))]
+    async fn rag_search(
+        &self,
+        request: Request<RagSearchRequest>,
+    ) -> Result<Response<RagSearchResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        
+        info!(
+            collection_id = %req.collection_id,
+            query_len = req.query.len(),
+            top_k = req.top_k,
+            "RAG search request"
+        );
+        
+        // Create RAG pipeline
+        let pipeline = my_ai_db::rag::RagPipeline::simple()
+            .map_err(|e| {
+                error!(error = %e, "Failed to create RAG pipeline");
+                Status::internal(format!("RAG pipeline error: {}", e))
+            })?;
+        
+        // Perform search
+        let results = pipeline.search(
+            &self.storage,
+            &req.collection_id,
+            &req.query,
+            req.top_k as usize,
+        ).await.map_err(|e| {
+            error!(error = %e, collection_id = %req.collection_id, "RAG search failed");
+            Status::internal(format!("RAG search error: {}", e))
+        })?;
+        
+        // Convert results
+        let result_items: Vec<RagResultItem> = results
+            .into_iter()
+            .map(|r| {
+                let chunk_id = r.chunk.id;
+                let doc_id = chunk_id
+                    .split('-')
+                    .next()
+                    .unwrap_or(chunk_id.as_str())
+                    .to_string();
+                RagResultItem {
+                    chunk_id,
+                    doc_id,
+                    text: r.chunk.text,
+                    score: r.score,
+                    metadata_json: serde_json::to_string(&r.chunk.metadata).unwrap_or_default(),
+                }
+            })
+            .collect();
+        
+        info!(
+            collection_id = %req.collection_id,
+            results_count = result_items.len(),
+            "RAG search completed"
+        );
+        
+        Ok(Response::new(RagSearchResponse {
+            success: true,
+            message: format!("Found {} results", result_items.len()),
+            results: result_items,
+        }))
+    }
+
+    /// RagGetDoc: Get RAG document chunks by document ID
+    #[instrument(skip(self, request), fields(collection_id, doc_id))]
+    async fn rag_get_doc(
+        &self,
+        request: Request<RagGetDocRequest>,
+    ) -> Result<Response<RagGetDocResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        
+        debug!(collection_id = %req.collection_id, doc_id = %req.doc_id, "RAG get doc request");
+        
+        let chunks = self.storage.get_rag_doc_chunks(&req.collection_id, &req.doc_id)
+            .map_err(|e| {
+                warn!(error = %e, collection_id = %req.collection_id, doc_id = %req.doc_id, "Document not found");
+                Status::not_found(format!("Document not found: {}", e))
+            })?;
+        
+        let rag_chunks: Vec<RagChunk> = chunks
+            .into_iter()
+            .map(|c| RagChunk {
+                id: c.id,
+                doc_id: c.doc_id,
+                text: c.text,
+                embedding: c.embedding,
+                chunk_index: c.chunk_index as u32,
+                total_chunks: c.total_chunks as u32,
+                source: c.source.unwrap_or_default(),
+                created_at: c.created_at,
+                metadata_json: serde_json::to_string(&c.metadata).unwrap_or_default(),
+            })
+            .collect();
+        
+        info!(
+            collection_id = %req.collection_id,
+            doc_id = %req.doc_id,
+            chunks = rag_chunks.len(),
+            "RAG document retrieved"
+        );
+        
+        Ok(Response::new(RagGetDocResponse {
+            success: true,
+            chunks: rag_chunks,
+        }))
+    }
+
+    /// RagDeleteDoc: Delete RAG document and all its chunks
+    #[instrument(skip(self, request), fields(collection_id, doc_id))]
+    async fn rag_delete_doc(
+        &self,
+        request: Request<RagDeleteDocRequest>,
+    ) -> Result<Response<RagDeleteDocResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        
+        debug!(collection_id = %req.collection_id, doc_id = %req.doc_id, "RAG delete doc request");
+        
+        self.storage.delete_rag_doc(&req.collection_id, &req.doc_id)
+            .map_err(|e| {
+                error!(error = %e, collection_id = %req.collection_id, doc_id = %req.doc_id, "Failed to delete RAG document");
+                Status::internal(format!("Delete error: {}", e))
+            })?;
+        
+        info!(collection_id = %req.collection_id, doc_id = %req.doc_id, "RAG document deleted");
+        
+        Ok(Response::new(RagDeleteDocResponse {
+            success: true,
+            message: format!("Document {} deleted", req.doc_id),
+        }))
+    }
+
+    /// RagListDocs: List all RAG document IDs in a collection
+    #[instrument(skip(self, request), fields(collection_id))]
+    async fn rag_list_docs(
+        &self,
+        request: Request<RagListDocsRequest>,
+    ) -> Result<Response<RagListDocsResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        
+        debug!(collection_id = %req.collection_id, "RAG list docs request");
+        
+        let doc_ids = self.storage.get_rag_doc_ids(&req.collection_id)
+            .map_err(|e| {
+                error!(error = %e, collection_id = %req.collection_id, "Failed to list RAG documents");
+                Status::internal(format!("List error: {}", e))
+            })?;
+        
+        info!(collection_id = %req.collection_id, doc_count = doc_ids.len(), "RAG documents listed");
+        
+        Ok(Response::new(RagListDocsResponse {
+            success: true,
+            doc_ids,
+        }))
+    }
+
+    /// RagEmbed: Generate embedding for text
+    #[instrument(skip(self, request))]
+    async fn rag_embed(
+        &self,
+        request: Request<RagEmbedRequest>,
+    ) -> Result<Response<RagEmbedResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        
+        debug!(text_len = req.text.len(), "RAG embed request");
+        
+        // Create RAG pipeline
+        let pipeline = my_ai_db::rag::RagPipeline::simple()
+            .map_err(|e| {
+                error!(error = %e, "Failed to create RAG pipeline");
+                Status::internal(format!("RAG pipeline error: {}", e))
+            })?;
+        
+        // Generate embedding
+        let embedding = pipeline.embed(&req.text)
+            .map_err(|e| {
+                error!(error = %e, "Failed to generate embedding");
+                Status::internal(format!("Embedding error: {}", e))
+            })?;
+        
+        let dimension = embedding.len() as u32;
+        
+        info!(dimension = dimension, "Embedding generated");
+        
+        Ok(Response::new(RagEmbedResponse {
+            success: true,
+            embedding,
+            dimension,
+        }))
     }
 }
 

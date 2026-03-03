@@ -30,6 +30,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 dotenvy = "0.15"
+# RAG System dependencies
+tokenizers = "0.19"  # HuggingFace tokenizers for text processing
+chrono = { version = "0.4", features = ["serde"] }  # For timestamps in RAG documents
 
 [build-dependencies]
 tonic-build = "0.12"

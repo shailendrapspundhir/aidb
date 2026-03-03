@@ -172,4 +172,105 @@ curl -X POST http://localhost:11111/sql -H "Content-Type: application/json" -d '
 
 Built for performance, modularity, and AI workloads (e.g., embeddings, RAG, analytics).
 
+## RAG System (Retrieval-Augmented Generation)
+
+aiDB now includes a built-in RAG system for ingesting text data and performing semantic similarity search. This is ideal for building AI-powered applications like chatbots, document search, and knowledge bases.
+
+### Features
+
+- **Text Chunking**: Automatically split large texts into manageable chunks with configurable size and overlap
+- **Embedding Generation**: Generate vector embeddings using n-gram hashing (lightweight, no external dependencies)
+- **Semantic Search**: Find similar documents using vector similarity (HNSW-based)
+- **Dual Storage**: Both text and embeddings stored together for efficient retrieval
+- **REST & gRPC APIs**: Full API support for all RAG operations
+
+### Quick Start with RAG
+
+```bash
+# 1. Start the server
+cargo run --bin my_ai_db
+
+# 2. Ingest text into a collection (requires authentication)
+curl -X POST http://localhost:11111/collections/my_collection/rag/ingest \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{
+    "doc_id": "doc_1",
+    "text": "This is a sample document about artificial intelligence and machine learning.",
+    "metadata_json": "{\"category\": \"tech\"}",
+    "source": "example.com"
+  }'
+
+# 3. Search for similar documents
+curl -X POST http://localhost:11111/collections/my_collection/rag/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{
+    "query": "machine learning and AI",
+    "top_k": 5
+  }'
+
+# 4. Generate embeddings for text
+curl -X POST http://localhost:11111/rag/embed \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{"text": "Hello, world!"}'
+```
+
+### RAG API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/collections/:id/rag/ingest` | POST | Ingest text into RAG system |
+| `/collections/:id/rag/search` | POST | Semantic search for similar documents |
+| `/collections/:id/rag/docs` | GET | List all RAG document IDs |
+| `/collections/:id/rag/docs/:doc_id` | GET | Get document chunks |
+| `/collections/:id/rag/docs/:doc_id` | DELETE | Delete a document |
+| `/rag/embed` | POST | Generate embedding for text |
+
+### Configuration
+
+The RAG system can be configured with:
+
+- **Embedding Dimension**: Size of the embedding vector (default: 384)
+- **Chunk Size**: Maximum tokens per chunk (default: 512)
+- **Chunk Overlap**: Overlap between chunks (default: 50)
+- **N-gram Range**: Range for n-gram hashing (default: 1-4)
+
+### gRPC RAG Methods
+
+```bash
+# Ingest text
+grpcurl -plaintext -d '{
+  "doc_id": "doc_1",
+  "text": "Sample text for RAG",
+  "collection_id": "my_collection"
+}' [::1]:50051 aidb.AiDbService/RagIngest
+
+# Search
+grpcurl -plaintext -d '{
+  "query": "search query",
+  "collection_id": "my_collection",
+  "top_k": 5
+}' [::1]:50051 aidb.AiDbService/RagSearch
+
+# Generate embedding
+grpcurl -plaintext -d '{"text": "Hello"}' [::1]:50051 aidb.AiDbService/RagEmbed
+```
+
+### Embedding Model
+
+The default embedding model uses **n-gram hashing** for generating text embeddings:
+
+- **Fast**: No model download or GPU required
+- **Lightweight**: Pure Rust implementation
+- **Deterministic**: Same text always produces the same embedding
+- **Suitable for**: Development, testing, and basic semantic similarity
+
+For production use with high-quality semantic embeddings, consider integrating with external embedding services like:
+- OpenAI Embeddings API
+- Cohere Embed API
+- HuggingFace Inference API
+- Self-hosted sentence-transformers
+
 See issues for roadmap!
