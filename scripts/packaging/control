@@ -1,0 +1,9 @@
+Package: aidb
+Version: 0.1.0
+Section: database
+Priority: optional
+Architecture: amd64
+Maintainer: aiDB Maintainers <maintainers@aidb.local>
+Depends: libc6, libssl3
+Description: aiDB hybrid vector database server
+ A hybrid vector database with REST, gRPC, SQL, NoSQL, and RAG support.

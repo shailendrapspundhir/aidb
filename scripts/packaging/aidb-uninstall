@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ "${1:-}" = "--purge" ]; then
+  sudo systemctl stop aidb.service || true
+  sudo systemctl disable aidb.service || true
+  sudo dpkg --purge aidb
+else
+  sudo systemctl stop aidb.service || true
+  sudo systemctl disable aidb.service || true
+  sudo dpkg -r aidb
+  echo "Run 'aidb-uninstall --purge' to remove data/logs." 
+fi

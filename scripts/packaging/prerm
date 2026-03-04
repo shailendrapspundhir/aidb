@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e
+
+systemctl stop aidb.service || true
+systemctl disable aidb.service || true
+systemctl daemon-reload

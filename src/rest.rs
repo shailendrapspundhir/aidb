@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json;  // For JSON parsing in NoSQL handler
 use std::sync::Arc;
 use tracing::{info, debug, warn, error, instrument};
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::storage::{Document, Storage};
 use crate::query::QueryEngine;
@@ -32,26 +34,26 @@ pub struct AppState {
     storage: Arc<Storage>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct UserRegister {
     pub username: String,
     pub password: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct UserLogin {
     pub username: String,
     pub password: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct LoginResponse {
     pub token: String,
     pub session_id: String,
 }
 
 /// DTO for NoSQL JSON insert (REST body)
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema, Clone)]
 pub struct InsertDocRest {
     pub id: String,
     pub text: String,
@@ -60,8 +62,38 @@ pub struct InsertDocRest {
     pub metadata_json: String,  // Flexible NoSQL JSON
 }
 
+/// DTO for batch NoSQL JSON insert
+#[derive(Deserialize, ToSchema)]
+pub struct BatchInsertDocRest {
+    pub documents: Vec<InsertDocRest>,
+}
+
+/// DTO for full-text search REST requests
+#[derive(Deserialize, ToSchema)]
+pub struct TextSearchRest {
+    pub query: String,
+    pub partial_match: bool,
+    pub case_sensitive: bool,
+    pub include_metadata: bool,
+}
+
+/// DTO for full-text search responses
+#[derive(Serialize, ToSchema)]
+pub struct TextSearchResponse {
+    pub success: bool,
+    pub message: String,
+    pub results: Vec<DocumentSummary>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DocumentSummary {
+    pub id: String,
+    pub text: String,
+    pub category: String,
+}
+
 /// Generic REST response (JSON)
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct RestResponse {
     pub success: bool,
     pub message: String,
@@ -97,6 +129,46 @@ async fn auth_middleware(
     Ok(next.run(req).await)
 }
 
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        register_handler,
+        login_handler,
+        insert_doc_handler,
+        batch_insert_doc_handler,
+        sql_handler,
+        text_search_handler,
+        hybrid_handler,
+        health_handler
+    ),
+    components(
+        schemas(UserRegister, UserLogin, LoginResponse, InsertDocRest, BatchInsertDocRest, TextSearchRest, TextSearchResponse, DocumentSummary, RestResponse, CreateTenantRest, CreateEnvRest, CreateCollectionRest, SqlRest, HybridRest)
+    ),
+    modifiers(&SecurityAddon),
+    tags(
+        (name = "aiDB", description = "aiDB REST API")
+    )
+)]
+struct ApiDoc;
+
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearerAuth",
+                utoipa::openapi::security::SecurityScheme::Http(
+                    utoipa::openapi::security::HttpBuilder::new()
+                        .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                        .bearer_format("JWT")
+                        .build(),
+                ),
+            );
+        }
+    }
+}
+
 /// Create Axum router with multi-model endpoints
 pub fn create_router(storage: Storage) -> Router {
     let state = Arc::new(AppState {
@@ -109,8 +181,10 @@ pub fn create_router(storage: Storage) -> Router {
         .route("/environments/:env_id/collections", post(create_collection_handler).get(get_collections_handler))
         .route("/environments/:env_id/collections/:col_id", delete(delete_collection_handler))
         .route("/collections/:collection_id/docs", post(insert_doc_handler).put(update_doc_handler).get(list_docs_handler))
+        .route("/collections/:collection_id/docs/batch", post(batch_insert_doc_handler))
         .route("/collections/:collection_id/docs/:doc_id", get(get_doc_handler).delete(delete_doc_handler))
         .route("/collections/:collection_id/sql", post(sql_handler))
+        .route("/collections/:collection_id/search", post(text_search_handler))
         .route("/collections/:collection_id/hybrid", post(hybrid_handler))
         // RAG System endpoints
         .route("/collections/:collection_id/rag/ingest", post(rag_ingest_handler))
@@ -126,6 +200,7 @@ pub fn create_router(storage: Storage) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     Router::new()
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/register", post(register_handler))
         .route("/login", post(login_handler))
         .route("/health", get(health_handler))
@@ -133,6 +208,16 @@ pub fn create_router(storage: Storage) -> Router {
         .with_state(state)
 }
 
+/// Handler: User registration
+#[utoipa::path(
+    post,
+    path = "/register",
+    request_body = UserRegister,
+    responses(
+        (status = 200, description = "User registered successfully", body = RestResponse),
+        (status = 400, description = "User already exists")
+    )
+)]
 async fn register_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UserRegister>,
@@ -164,6 +249,16 @@ async fn register_handler(
     }))
 }
 
+/// Handler: User login
+#[utoipa::path(
+    post,
+    path = "/login",
+    request_body = UserLogin,
+    responses(
+        (status = 200, description = "User logged in successfully", body = LoginResponse),
+        (status = 401, description = "Unauthorized")
+    )
+)]
 async fn login_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UserLogin>,
@@ -194,12 +289,25 @@ async fn login_handler(
     Ok(Json(LoginResponse { token, session_id }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreateTenantRest {
     pub id: String,
     pub name: String,
 }
 
+/// Handler: Create tenant
+#[utoipa::path(
+    post,
+    path = "/tenants",
+    request_body = CreateTenantRest,
+    responses(
+        (status = 200, description = "Tenant created successfully", body = RestResponse),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
 async fn create_tenant_handler(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<AuthPayload>,
@@ -248,7 +356,7 @@ async fn get_tenants_handler(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreateEnvRest {
     pub id: String,
     pub name: String,
@@ -302,7 +410,7 @@ async fn get_envs_handler(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreateCollectionRest {
     pub id: String,
     pub name: String,
@@ -356,6 +464,21 @@ async fn get_collections_handler(
 }
 
 /// Handler: Insert NoSQL Document (JSON/Serde to Sled)
+#[utoipa::path(
+    post,
+    path = "/collections/{collection_id}/docs",
+    request_body = InsertDocRest,
+    responses(
+        (status = 200, description = "Document inserted successfully", body = RestResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("collection_id" = String, Path, description = "Collection ID")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
 async fn insert_doc_handler(
     State(state): State<Arc<AppState>>,
     Path(collection_id): Path<String>,
@@ -390,9 +513,74 @@ async fn insert_doc_handler(
     }
 }
 
+/// Handler: Batch Insert NoSQL Documents
+#[utoipa::path(
+    post,
+    path = "/collections/{collection_id}/docs/batch",
+    request_body = BatchInsertDocRest,
+    responses(
+        (status = 200, description = "Batch of documents inserted successfully", body = RestResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("collection_id" = String, Path, description = "Collection ID")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+async fn batch_insert_doc_handler(
+    State(state): State<Arc<AppState>>,
+    Path(collection_id): Path<String>,
+    Json(payload): Json<BatchInsertDocRest>,
+) -> Result<Json<RestResponse>, StatusCode> {
+    debug!(collection_id = %collection_id, count = payload.documents.len(), "REST batch insert doc request");
+    
+    let mut docs = Vec::new();
+    for p in &payload.documents {
+        let metadata_json: serde_json::Value = serde_json::from_str(&p.metadata_json)
+            .unwrap_or(serde_json::json!({}));
+        docs.push(Document {
+            id: p.id.clone(),
+            text: p.text.clone(),
+            category: p.category.clone(),
+            vector: p.vector.clone(),
+            metadata: metadata_json,
+        });
+    }
+
+    let payload_len = payload.documents.len();
+
+    if state.storage.insert_docs(docs, &collection_id).is_ok() {
+        info!(collection_id = %collection_id, count = payload_len, "Batch of documents inserted via REST");
+        Ok(Json(RestResponse {
+            success: true,
+            message: format!("Batch of {} docs inserted", payload_len),
+            results: vec![],
+            cache_hits: None,
+        }))
+    } else {
+        error!(collection_id = %collection_id, "Failed to insert batch of documents");
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+
 /// Handler: SQL query via DataFusion (on NoSQL Arrow projection)
-/// Fixed: error handling/logging , full Arrow parse , supports SELECT/UPDATE/DELETE
-/// (mutating queries re-project in prod; returns results or affected note)
+#[utoipa::path(
+    post,
+    path = "/collections/{collection_id}/sql",
+    request_body = SqlRest,
+    responses(
+        (status = 200, description = "SQL query executed successfully", body = RestResponse),
+        (status = 400, description = "Bad request")
+    ),
+    params(
+        ("collection_id" = String, Path, description = "Collection ID")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
 async fn sql_handler(
     State(state): State<Arc<AppState>>,
     Path(collection_id): Path<String>,
@@ -441,13 +629,68 @@ async fn sql_handler(
     }))
 }
 
-/// DTO for SQL REST
-#[derive(Deserialize)]
-pub struct SqlRest {
-    pub sql: String,
+/// Handler: Full-text search
+#[utoipa::path(
+    post,
+    path = "/collections/{collection_id}/search",
+    request_body = TextSearchRest,
+    responses(
+        (status = 200, description = "Text search executed successfully", body = TextSearchResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("collection_id" = String, Path, description = "Collection ID")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+async fn text_search_handler(
+    State(state): State<Arc<AppState>>,
+    Path(collection_id): Path<String>,
+    Json(payload): Json<TextSearchRest>,
+) -> Result<Json<TextSearchResponse>, StatusCode> {
+    let docs = state.storage.search_docs_text(
+        &collection_id,
+        &payload.query,
+        payload.partial_match,
+        payload.case_sensitive,
+        payload.include_metadata,
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let results: Vec<DocumentSummary> = docs
+        .into_iter()
+        .map(|doc| DocumentSummary {
+            id: doc.id,
+            text: doc.text,
+            category: doc.category,
+        })
+        .collect();
+
+    Ok(Json(TextSearchResponse {
+        success: true,
+        message: format!("Text search matched {} documents", results.len()),
+        results,
+    }))
 }
 
+
 /// Handler: Hybrid search (SQL + vector via planner)
+#[utoipa::path(
+    post,
+    path = "/collections/{collection_id}/hybrid",
+    request_body = HybridRest,
+    responses(
+        (status = 200, description = "Hybrid search completed successfully", body = RestResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("collection_id" = String, Path, description = "Collection ID")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
 async fn hybrid_handler(
     State(state): State<Arc<AppState>>,
     Path(collection_id): Path<String>,
@@ -494,14 +737,27 @@ async fn hybrid_handler(
 }
 
 /// DTO for hybrid REST
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct HybridRest {
     pub sql_filter: String,
     pub query_vector: Vec<f32>,
     pub top_k: usize,
 }
 
+/// DTO for SQL REST
+#[derive(Deserialize, ToSchema)]
+pub struct SqlRest {
+    pub sql: String,
+}
+
 /// Health check handler
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "aiDB REST API healthy", body = RestResponse)
+    )
+)]
 async fn health_handler() -> Json<RestResponse> {
     debug!("REST health check");
     Json(RestResponse {

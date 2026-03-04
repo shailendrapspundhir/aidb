@@ -61,6 +61,33 @@ grpcurl -plaintext -d '{"query": "vector database"}' [::1]:50051 aidb.AiDbServic
 - Verified: Arrow RecordBatch + vector insert/retrieve by ID in Sled
 - Load script for data ingestion
 
+## Debian Package & Systemd Service
+Build a Debian package that installs the aiDB server, configures a systemd service (auto-restart on failure), and includes an uninstall helper.
+
+```bash
+# Build the release .deb package
+./scripts/build_deb.sh
+
+# Install the package (creates aidb user, systemd service)
+sudo dpkg -i dist/aidb_<version>_amd64.deb
+
+# Start / check status
+sudo systemctl status aidb.service
+sudo systemctl restart aidb.service
+
+# Uninstall (keep data/logs)
+sudo aidb-uninstall
+
+# Uninstall and purge data/logs
+sudo aidb-uninstall --purge
+```
+
+Service details:
+- Binary installed to `/usr/bin/aidb-server`
+- Data dir: `/var/lib/aidb`
+- Logs: `/var/log/aidb/aidb.log.json`
+- Systemd service: `/lib/systemd/system/aidb.service`
+
 ## Build & Run with Docker
 ```bash
 docker build -t aidb .

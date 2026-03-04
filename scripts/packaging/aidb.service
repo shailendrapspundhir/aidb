@@ -1,0 +1,16 @@
+[Unit]
+Description=aiDB server
+After=network.target
+
+[Service]
+Type=simple
+User=aidb
+Group=aidb
+ExecStart=/usr/bin/aidb-server
+WorkingDirectory=/var/lib/aidb
+Restart=on-failure
+RestartSec=5s
+Environment=AIDB_LOG_FILE=/var/log/aidb/aidb.log.json
+
+[Install]
+WantedBy=multi-user.target

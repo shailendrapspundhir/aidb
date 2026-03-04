@@ -1,0 +1,12 @@
+#!/bin/bash
+set -e
+
+if ! id -u aidb >/dev/null 2>&1; then
+  adduser --system --group --no-create-home aidb
+fi
+
+chown -R aidb:aidb /var/lib/aidb /var/log/aidb
+
+systemctl daemon-reload
+systemctl enable aidb.service
+systemctl restart aidb.service

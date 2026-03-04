@@ -1,0 +1,9 @@
+#!/bin/bash
+set -e
+
+if [ "$1" = "purge" ]; then
+  rm -rf /var/lib/aidb /var/log/aidb
+  if id -u aidb >/dev/null 2>&1; then
+    deluser --system aidb || true
+  fi
+fi

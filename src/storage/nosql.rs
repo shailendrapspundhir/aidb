@@ -30,6 +30,60 @@ impl Storage {
         Ok(())
     }
 
+    /// Insert multiple NoSQL Documents (batch) into unified Sled storage
+    #[instrument(skip(self, docs), fields(count = docs.len(), collection_id))]
+    pub fn insert_docs(&self, docs: Vec<Document>, collection_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        debug!(count = docs.len(), collection_id = %collection_id, "Inserting batch of NoSQL documents");
+        
+        let mut doc_batch = sled::Batch::default();
+        let mut metadata_batch_op = sled::Batch::default();
+        let mut vector_batch = sled::Batch::default();
+
+        for doc in &docs {
+            let json_bytes = serde_json::to_vec(doc)?;
+            let key = format!("{}/{}", collection_id, doc.id);
+            doc_batch.insert(key.as_bytes(), json_bytes);
+
+            // Sync to vector/Arrow
+            let metadata_batch = crate::storage::create_metadata_batch(&doc.id, &doc.text)?;
+            
+            // Serialize metadata RecordBatch to IPC bytes (inline logic from Storage::insert)
+            let mut metadata_buf = Vec::new();
+            {
+                use arrow::ipc::writer::FileWriter;
+                let mut writer = FileWriter::try_new(&mut metadata_buf, metadata_batch.schema().as_ref())?;
+                writer.write(&metadata_batch)?;
+                writer.finish()?;
+            }
+            metadata_batch_op.insert(key.as_bytes(), metadata_buf);
+
+            // Serialize vector to bytes
+            let vector_bytes: Vec<u8> = doc.vector
+                .iter()
+                .flat_map(|&f| f.to_le_bytes().to_vec())
+                .collect();
+            vector_batch.insert(key.as_bytes(), vector_bytes);
+        }
+
+        // Apply batches
+        self.doc_tree.apply_batch(doc_batch)?;
+        self.metadata_tree.apply_batch(metadata_batch_op)?;
+        self.vector_tree.apply_batch(vector_batch)?;
+
+        let docs_len = docs.len();
+
+        // Update cache
+        if let Ok(mut cache) = self.doc_cache.lock() {
+            for doc in docs {
+                let key = format!("{}/{}", collection_id, doc.id);
+                cache.insert(key, doc);
+            }
+        }
+        
+        info!(count = docs_len, collection_id = %collection_id, "Batch insertion successful");
+        Ok(())
+    }
+
     /// Retrieve NoSQL Document by ID (deserializes JSON from Sled)
     /// Enables dynamic/unstructured access.
     #[instrument(skip(self), fields(key))]
@@ -82,6 +136,57 @@ impl Storage {
         }
         info!(collection_id = %collection_id, count = docs.len(), "Documents retrieved");
         Ok(docs)
+    }
+
+    /// Full/partial text search across documents in a collection
+    #[instrument(skip(self, query), fields(collection_id, partial_match, case_sensitive, include_metadata))]
+    pub fn search_docs_text(
+        &self,
+        collection_id: &str,
+        query: &str,
+        partial_match: bool,
+        case_sensitive: bool,
+        include_metadata: bool,
+    ) -> Result<Vec<Document>, Box<dyn std::error::Error>> {
+        debug!(collection_id = %collection_id, query = %query, "Text search request");
+        let docs = self.get_docs_in_collection(collection_id)?;
+        let query_norm = if case_sensitive {
+            query.to_string()
+        } else {
+            query.to_lowercase()
+        };
+
+        let mut matches = Vec::new();
+        for doc in docs {
+            let mut haystack = doc.text.clone();
+            if include_metadata {
+                haystack.push(' ');
+                haystack.push_str(&doc.category);
+                haystack.push(' ');
+                if let Ok(meta_str) = serde_json::to_string(&doc.metadata) {
+                    haystack.push_str(&meta_str);
+                }
+            }
+
+            if !case_sensitive {
+                haystack = haystack.to_lowercase();
+            }
+
+            let is_match = if partial_match {
+                haystack.contains(&query_norm)
+            } else {
+                haystack
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|token| token == query_norm)
+            };
+
+            if is_match {
+                matches.push(doc);
+            }
+        }
+
+        info!(collection_id = %collection_id, match_count = matches.len(), "Text search completed");
+        Ok(matches)
     }
 
     /// Update NoSQL Document by ID (upsert JSON in Sled ; syncs metadata/vector)

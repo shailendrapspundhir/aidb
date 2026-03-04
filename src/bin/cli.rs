@@ -63,6 +63,12 @@ enum Commands {
         #[arg(short = 'm', long, default_value = "{}")]
         metadata: String,
     },
+    BatchInsert {
+        #[arg(short = 'C', long = "collection")]
+        collection_id: String,
+        #[arg(short, long)]
+        file: String,
+    },
     Update {
         #[arg(short = 'C', long = "collection")]
         collection_id: String,
@@ -134,6 +140,18 @@ enum Commands {
         query: String,
         #[arg(short, long, default_value_t = 5)]
         top_k: usize,
+    },
+    Search {
+        #[arg(short = 'C', long = "collection")]
+        collection_id: String,
+        #[arg(short, long)]
+        query: String,
+        #[arg(short, long)]
+        partial_match: bool,
+        #[arg(short, long)]
+        case_sensitive: bool,
+        #[arg(short, long)]
+        include_metadata: bool,
     },
     Logout,
 }
@@ -210,6 +228,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "vector": vec![0.0; 4], // Placeholder
                     "metadata_json": metadata
                 }))
+                .send()
+                .await?;
+            println!("Response: {}", res.text().await?);
+        }
+        Commands::BatchInsert { collection_id, file } => {
+            let token = fs::read_to_string(".aidb_token").unwrap_or_default();
+            let data = fs::read_to_string(file)?;
+            let docs: serde_json::Value = serde_json::from_str(&data)?;
+            let payload = if docs.is_array() {
+                json!({ "documents": docs })
+            } else {
+                docs
+            };
+            let res = client.post(format!("{}/collections/{}/docs/batch", cli.url, collection_id))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&payload)
                 .send()
                 .await?;
             println!("Response: {}", res.text().await?);
@@ -320,6 +354,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let res = client.post(format!("{}/collections/{}/rag/search", cli.url, collection_id))
                 .header("Authorization", format!("Bearer {}", token))
                 .json(&json!({ "query": query, "top_k": top_k }))
+                .send()
+                .await?;
+            println!("Response: {}", res.text().await?);
+        }
+        Commands::Search {
+            collection_id,
+            query,
+            partial_match,
+            case_sensitive,
+            include_metadata,
+        } => {
+            let token = fs::read_to_string(".aidb_token").unwrap_or_default();
+            let res = client.post(format!("{}/collections/{}/search", cli.url, collection_id))
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&json!({
+                    "query": query,
+                    "partial_match": partial_match,
+                    "case_sensitive": case_sensitive,
+                    "include_metadata": include_metadata
+                }))
                 .send()
                 .await?;
             println!("Response: {}", res.text().await?);

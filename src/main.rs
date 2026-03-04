@@ -38,7 +38,9 @@ pub mod aidb {
 use aidb::{
     ai_db_service_server::{AiDbService, AiDbServiceServer},
     HybridRequest, HybridResponse, InsertDocRequest, InsertRequest, InsertResponse,
+    BatchInsertRequest, BatchInsertDocRequest,
     SearchRequest, SearchResponse, SqlRequest, SqlResponse, VectorSearchRequest,
+    TextSearchRequest, TextSearchResponse, TextSearchItem,
     RegisterRequest, RegisterResponse, LoginRequest, LoginResponse,
     CreateTenantRequest, CreateTenantResponse, CreateEnvironmentRequest, CreateEnvironmentResponse,
     CreateCollectionRequest, CreateCollectionResponse,
@@ -308,6 +310,47 @@ impl AiDbService for AiDbServiceImpl {
         Ok(Response::new(SearchResponse { results }))
     }
 
+    #[instrument(skip(self, request), fields(collection_id))]
+    async fn text_search(
+        &self,
+        request: Request<TextSearchRequest>,
+    ) -> Result<Response<TextSearchResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        let collection_id = req.collection_id.clone();
+
+        info!(collection_id = %collection_id, query = %req.query, "Text search request received");
+
+        let docs = self
+            .storage
+            .search_docs_text(
+                &collection_id,
+                &req.query,
+                req.partial_match,
+                req.case_sensitive,
+                req.include_metadata,
+            )
+            .map_err(|e| {
+                error!(error = %e, collection_id = %collection_id, "Text search failed");
+                Status::internal(format!("Text search error: {}", e))
+            })?;
+
+        let results: Vec<TextSearchItem> = docs
+            .into_iter()
+            .map(|doc| TextSearchItem {
+                id: doc.id,
+                text: doc.text,
+                category: doc.category,
+            })
+            .collect();
+
+        Ok(Response::new(TextSearchResponse {
+            success: true,
+            message: format!("Text search matched {} documents", results.len()),
+            results,
+        }))
+    }
+
     /// InsertDoc: NoSQL document insert using Serde JSON to Sled
     /// Unified storage for unstructured data; auto-projects to Arrow for SQL.
     #[instrument(skip(self, request), fields(id, collection_id))]
@@ -346,6 +389,78 @@ impl AiDbService for AiDbServiceImpl {
             })?;
 
         info!(id = %req.id, collection_id = %collection_id, "InsertDoc completed successfully");
+        Ok(Response::new(InsertResponse { success: true }))
+    }
+
+    #[instrument(skip(self, request), fields(collection_id))]
+    async fn batch_insert(
+        &self,
+        request: Request<BatchInsertRequest>,
+    ) -> Result<Response<InsertResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        let collection_id = req.collection_id;
+        if collection_id.is_empty() { 
+            return Err(Status::invalid_argument("Missing collection_id")); 
+        }
+
+        info!(collection_id = %collection_id, count = req.requests.len(), "BatchInsert request received");
+
+        let mut docs = Vec::new();
+        for r in req.requests {
+            docs.push(Document {
+                id: r.id,
+                text: r.text,
+                category: "vector".to_string(),
+                vector: r.vector,
+                metadata: serde_json::json!({}),
+            });
+        }
+
+        self.storage.insert_docs(docs, &collection_id)
+            .map_err(|e| {
+                error!(error = %e, collection_id = %collection_id, "BatchInsert failed");
+                Status::internal(format!("Batch insert error: {}", e))
+            })?;
+
+        info!(collection_id = %collection_id, "BatchInsert completed successfully");
+        Ok(Response::new(InsertResponse { success: true }))
+    }
+
+    #[instrument(skip(self, request), fields(collection_id))]
+    async fn batch_insert_doc(
+        &self,
+        request: Request<BatchInsertDocRequest>,
+    ) -> Result<Response<InsertResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        let collection_id = req.collection_id;
+        if collection_id.is_empty() { 
+            return Err(Status::invalid_argument("Missing collection_id")); 
+        }
+
+        info!(collection_id = %collection_id, count = req.requests.len(), "BatchInsertDoc request received");
+
+        let mut docs = Vec::new();
+        for r in req.requests {
+            let metadata_json: serde_json::Value = serde_json::from_str(&r.metadata_json)
+                .unwrap_or(serde_json::json!({}));
+            docs.push(Document {
+                id: r.id,
+                text: r.text,
+                category: r.category,
+                vector: r.vector,
+                metadata: metadata_json,
+            });
+        }
+
+        self.storage.insert_docs(docs, &collection_id)
+            .map_err(|e| {
+                error!(error = %e, collection_id = %collection_id, "BatchInsertDoc failed");
+                Status::internal(format!("Batch insert error: {}", e))
+            })?;
+
+        info!(collection_id = %collection_id, "BatchInsertDoc completed successfully");
         Ok(Response::new(InsertResponse { success: true }))
     }
 

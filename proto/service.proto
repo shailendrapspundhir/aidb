@@ -16,10 +16,16 @@ service AiDbService {
 
   // Insert metadata (as Arrow internally) and vector into storage
   rpc Insert (InsertRequest) returns (InsertResponse);
+  // Batch insert metadata and vectors
+  rpc BatchInsert (BatchInsertRequest) returns (InsertResponse);
   // Insert full NoSQL Document (JSON for unstructured/flexible schema)
   rpc InsertDoc (InsertDocRequest) returns (InsertResponse);
+  // Batch insert full NoSQL Documents
+  rpc BatchInsertDoc (BatchInsertDocRequest) returns (InsertResponse);
   // Text-based search (placeholder)
   rpc Search (SearchRequest) returns (SearchResponse);
+  // Full/partial text search
+  rpc TextSearch (TextSearchRequest) returns (TextSearchResponse);
   // Vector-based ANN search using HNSW index
   rpc VectorSearch (VectorSearchRequest) returns (SearchResponse);
   // Execute SQL query on projected Arrow data (from NoSQL JSON)
@@ -79,6 +85,16 @@ message InsertResponse {
   bool success = 1;
 }
 
+message BatchInsertRequest {
+  repeated InsertRequest requests = 1;
+  string collection_id = 2;
+}
+
+message BatchInsertDocRequest {
+  repeated InsertDocRequest requests = 1;
+  string collection_id = 2;
+}
+
 message SearchRequest {
   string query = 1;
   string collection_id = 2;
@@ -115,6 +131,26 @@ message HybridResponse {
 
 message SearchResponse {
   repeated string results = 1;  // IDs of matching documents
+}
+
+message TextSearchRequest {
+  string query = 1;
+  string collection_id = 2;
+  bool partial_match = 3;
+  bool case_sensitive = 4;
+  bool include_metadata = 5;
+}
+
+message TextSearchItem {
+  string id = 1;
+  string text = 2;
+  string category = 3;
+}
+
+message TextSearchResponse {
+  bool success = 1;
+  string message = 2;
+  repeated TextSearchItem results = 3;
 }
 
 // === RAG System Messages ===

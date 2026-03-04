@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use crate::auth::{create_jwt, hash_password, verify_password};
 use crate::network::api::rest::models::{
-    CreateCollectionRest, CreateEnvRest, CreateTenantRest, HybridRest, InsertDocRest,
-    LoginResponse, RestResponse, SqlRest, UpdateDocRest, UserLogin, UserRegister,
+    BatchInsertDocRest, CreateCollectionRest, CreateEnvRest, CreateTenantRest, DocumentSummary,
+    HybridRest, InsertDocRest, LoginResponse, RestResponse, SqlRest, TextSearchRest,
+    TextSearchResponse, UpdateDocRest, UserLogin, UserRegister,
 };
 use crate::network::api::rest::state::AppState;
 use crate::query::QueryEngine;
@@ -218,6 +219,37 @@ pub async fn insert_doc_handler(
     }
 }
 
+/// Handler: Batch Insert NoSQL Documents
+pub async fn batch_insert_doc_handler(
+    State(state): State<Arc<AppState>>,
+    Path(collection_id): Path<String>,
+    Json(payload): Json<BatchInsertDocRest>,
+) -> Result<Json<RestResponse>, StatusCode> {
+    let mut docs = Vec::new();
+    for p in payload.documents {
+        let metadata_json: serde_json::Value = serde_json::from_str(&p.metadata_json)
+            .unwrap_or(serde_json::json!({}));
+        docs.push(Document {
+            id: p.id,
+            text: p.text,
+            category: p.category,
+            vector: p.vector,
+            metadata: metadata_json,
+        });
+    }
+
+    if state.storage.insert_docs(docs, &collection_id).is_ok() {
+        Ok(Json(RestResponse {
+            success: true,
+            message: format!("Batch of {} docs inserted", payload.documents.len()),
+            results: vec![],
+            cache_hits: None,
+        }))
+    } else {
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+
 /// Handler: SQL query via DataFusion
 pub async fn sql_handler(
     State(state): State<Arc<AppState>>,
@@ -262,6 +294,36 @@ pub async fn sql_handler(
         message: format!("SQL executed: {} rows", res_ids.len()),
         results: res_ids,
         cache_hits: None,
+    }))
+}
+
+/// Handler: Full-text search
+pub async fn text_search_handler(
+    State(state): State<Arc<AppState>>,
+    Path(collection_id): Path<String>,
+    Json(payload): Json<TextSearchRest>,
+) -> Result<Json<TextSearchResponse>, StatusCode> {
+    let docs = state.storage.search_docs_text(
+        &collection_id,
+        &payload.query,
+        payload.partial_match,
+        payload.case_sensitive,
+        payload.include_metadata,
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let results = docs
+        .into_iter()
+        .map(|doc| DocumentSummary {
+            id: doc.id,
+            text: doc.text,
+            category: doc.category,
+        })
+        .collect();
+
+    Ok(Json(TextSearchResponse {
+        success: true,
+        message: format!("Text search matched {} documents", results.len()),
+        results,
     }))
 }
 
