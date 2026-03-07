@@ -5,9 +5,13 @@
 //! with predicate push-down for performance.
 //! E.g., SELECT * FROM docs WHERE category='AI' AND vector similarity...
 
+pub mod aggregation;
+pub mod cross_collection;
 pub mod sql;
 pub mod vector;
 
+pub use aggregation::AggregationEngine;
+pub use cross_collection::CrossCollectionEngine;
 pub use sql::QueryEngine;
 
 #[cfg(test)]

@@ -1,12 +1,22 @@
 #!/bin/bash
 
+# REST API Test Script for aiDB
+# Uses only curl/REST APIs, no CLI binary
+
+set -e
+
 # Configuration
 URL="http://localhost:11111"
-CLI="cargo run --quiet --bin cli -- --url $URL"
-LOG_CLI="cargo run --quiet --bin aidb-cli --"
 SERVER_BIN="cargo run --quiet --bin my_ai_db"
 LOG_FILE_PATH="$(pwd)/logs/aidb.log.json"
 export AIDB_LOG_FILE="$LOG_FILE_PATH"
+
+REST_TOKEN=""
+
+echo "=========================================="
+echo "aiDB REST API Test Suite"
+echo "=========================================="
+echo ""
 
 echo "Starting my_ai_db server..."
 $SERVER_BIN &
@@ -16,30 +26,67 @@ echo "Server started with PID: $PID"
 # Wait for server to start
 sleep 10
 
-# Helper to run CLI
-run_cli() {
-  $CLI "$@"
+# Helper function for authenticated API calls
+auth_api_call() {
+  local METHOD=$1
+  local ENDPOINT=$2
+  local DATA=$3
+
+  if [ -n "$DATA" ]; then
+    curl -s -X "$METHOD" "$URL$ENDPOINT" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $REST_TOKEN" \
+      -d "$DATA"
+  else
+    curl -s -X "$METHOD" "$URL$ENDPOINT" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $REST_TOKEN"
+  fi
+}
+
+# Helper for unauthenticated calls (register/login)
+api_call() {
+  local METHOD=$1
+  local ENDPOINT=$2
+  local DATA=$3
+
+  if [ -n "$DATA" ]; then
+    curl -s -X "$METHOD" "$URL$ENDPOINT" \
+      -H "Content-Type: application/json" \
+      -d "$DATA"
+  else
+    curl -s -X "$METHOD" "$URL$ENDPOINT" \
+      -H "Content-Type: application/json"
+  fi
 }
 
 echo "1. Registering user 'admin'..."
-run_cli register --username admin --password admin
+api_call POST /register '{"username":"admin","password":"admin"}'
+echo ""
 
-echo "2. Logging in..."
-LOGIN_OUTPUT=$(run_cli login --username admin --password admin)
-echo "$LOGIN_OUTPUT"
-SESSION_ID=$(echo "$LOGIN_OUTPUT" | sed -n 's/^Session ID: //p')
+echo "2. Logging in and getting token..."
+LOGIN_RESPONSE=$(api_call POST /login '{"username":"admin","password":"admin"}')
+echo "$LOGIN_RESPONSE"
+REST_TOKEN=$(echo "$LOGIN_RESPONSE" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+SESSION_ID=$(echo "$LOGIN_RESPONSE" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
+echo ""
 
 echo "3. Creating tenant 'tenant1'..."
-run_cli create-tenant --id tenant1 --name tenant1
+auth_api_call POST /tenants '{"id":"tenant1","name":"Tenant One"}'
+echo ""
 
 echo "4. Creating environment 'dev'..."
-run_cli create-env -t tenant1 --id dev --name dev
+auth_api_call POST /tenants/tenant1/environments '{"id":"dev","name":"Development"}'
+echo ""
 
-echo "5. Creating collections: users, addresses, data, rag..."
-run_cli create-collection -e dev --id users --name users
-run_cli create-collection -e dev --id addresses --name addresses
-run_cli create-collection -e dev --id data --name data
-run_cli create-collection -e dev --id rag --name rag
+echo "5. Creating collections..."
+auth_api_call POST /environments/dev/collections '{"id":"users","name":"Users"}'
+auth_api_call POST /environments/dev/collections '{"id":"addresses","name":"Addresses"}'
+auth_api_call POST /environments/dev/collections '{"id":"orders","name":"Orders"}'
+auth_api_call POST /environments/dev/collections '{"id":"payments","name":"Payments"}'
+auth_api_call POST /environments/dev/collections '{"id":"products","name":"Products"}'
+echo "Collections created"
+echo ""
 
 # echo "6. Storing 10 documents in each collection..."
 # for i in {1..10}; do
@@ -187,17 +234,49 @@ run_search "Search for 'safety'" '--query safety'
 #   run_cli delete-doc -C data --id item$i
 # done
 
-echo "11. Removing 'data' collection..."
+# Cross-collection demos
+
+echo "7. Inserting cross-collection data (users, addresses, orders, payments)..."
+run_cli insert -C users --id user1 -t "User 1" -c "person" -m "{\"email\":\"user1@example.com\",\"region\":\"north\"}"
+run_cli insert -C users --id user2 -t "User 2" -c "person" -m "{\"email\":\"user2@example.com\",\"region\":\"south\"}"
+run_cli insert -C addresses --id addr1 -t "Address 1" -c "place" -m "{\"user_id\":\"user1\",\"city\":\"Austin\",\"state\":\"TX\"}"
+run_cli insert -C addresses --id addr2 -t "Address 2" -c "place" -m "{\"user_id\":\"user2\",\"city\":\"Seattle\",\"state\":\"WA\"}"
+run_cli insert -C orders --id order1 -t "Order 1" -c "order" -m "{\"user_id\":\"user1\",\"total\":120.5,\"status\":\"shipped\"}"
+run_cli insert -C orders --id order2 -t "Order 2" -c "order" -m "{\"user_id\":\"user1\",\"total\":42.0,\"status\":\"processing\"}"
+run_cli insert -C orders --id order3 -t "Order 3" -c "order" -m "{\"user_id\":\"user2\",\"total\":99.9,\"status\":\"delivered\"}"
+run_cli insert -C payments --id payment1 -t "Payment 1" -c "payment" -m "{\"order_id\":\"order1\",\"amount\":120.5,\"method\":\"card\"}"
+run_cli insert -C payments --id payment2 -t "Payment 2" -c "payment" -m "{\"order_id\":\"order2\",\"amount\":42.0,\"method\":\"cash\"}"
+run_cli insert -C payments --id payment3 -t "Payment 3" -c "payment" -m "{\"order_id\":\"order3\",\"amount\":99.9,\"method\":\"card\"}"
+
+echo "8. Cross-collection lookup: users with addresses"
+auth_api_call POST /collections/cross/query '{"source":"users","stages":[{"lookup":{"from":"addresses","local_field":"id","foreign_field":"metadata.user_id","as":"user_addresses"}}]}'
+
+echo "9. Cross-collection join: orders with payments"
+auth_api_call POST /collections/cross/query '{"source":"orders","stages":[{"join":{"join_type":"left","from":"payments","local_field":"id","foreign_field":"metadata.order_id","as":"payment"}}]}'
+
+echo "10. Cross-collection union: users + orders + payments"
+auth_api_call POST /collections/cross/query '{"source":"users","stages":[{"union":{"collections":["orders","payments"]}}]}'
+
+echo "11. Multi-collection insert (users + orders)"
+auth_api_call POST /collections/cross/operation '{"operation":"insert","collections":["users","orders"],"documents":[{"id":"user3","text":"User 3","category":"person","vector":[0.0,0.0,0.0,0.0],"metadata":{"email":"user3@example.com","region":"west"}},{"id":"order4","text":"Order 4","category":"order","vector":[0.0,0.0,0.0,0.0],"metadata":{"user_id":"user3","total":250.0,"status":"processing"}}]}'
+
+echo "12. Multi-collection update (orders + payments)"
+auth_api_call POST /collections/cross/operation '{"operation":"update","collections":["orders","payments"],"documents":[{"id":"order2","metadata":{"status":"delivered"}},{"id":"payment2","metadata":{"method":"wire"}}]}'
+
+echo "13. Multi-collection delete (orders + payments)"
+auth_api_call POST /collections/cross/operation '{"operation":"delete","collections":["orders","payments"],"documents":[{"id":"order4"},{"id":"payment2"}]}'
+
+echo "14. Removing 'data' collection..."
 run_cli delete-collection -e dev --id data
 
 if [ -z "$SESSION_ID" ]; then
   echo "Session ID not found in login output; skipping log fetch."
 else
-  echo "12. Fetching logs for session: $SESSION_ID"
+  echo "15. Fetching logs for session: $SESSION_ID"
   $LOG_CLI fetch-logs --session-id "$SESSION_ID"
 fi
 
-echo "13. Logging out..."
+echo "16. Logging out..."
 run_cli logout
 
 echo "Stopping server (PID: $PID)..."

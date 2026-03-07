@@ -130,7 +130,7 @@ grpcurl -plaintext -d '{
 
 ## REST API Exposure (on port 11111)
 Exposed via Axum HTTP/JSON (concurrent with gRPC; curl-friendly):
-- Endpoints mirror multi-model: `/insert_doc`, `/sql`, `/hybrid_search`, `/health`.
+- Endpoints mirror multi-model: `/insert_doc`, `/sql`, `/aggregate`, `/hybrid_search`, `/health`.
 - Start server: `cargo run --bin my_ai_db` (both gRPC:50051 + REST:11111).
 
 ### cURL Examples (Direct HTTP)
@@ -150,6 +150,17 @@ curl -X POST http://localhost:11111/insert_doc \
 curl -X POST http://localhost:11111/sql \
   -H "Content-Type: application/json" \
   -d '{"sql": "SELECT id, category FROM docs WHERE category = \"AI\""}'
+
+# Aggregation pipeline
+curl -X POST http://localhost:11111/collections/my_collection/aggregate \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{
+    "pipeline": [
+      {"match": {"filters": [{"field": "category", "op": "eq", "value": "AI"}]}},
+      {"group": {"by": ["category"], "aggregations": [{"op": "count", "as": "doc_count"}]}}
+    ]
+  }'
 
 # Hybrid search (SQL filter + vector)
 curl -X POST http://localhost:11111/hybrid_search \

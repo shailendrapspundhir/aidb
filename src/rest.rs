@@ -22,7 +22,12 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::storage::{Document, Storage};
-use crate::query::QueryEngine;
+use crate::query::{
+    aggregation::AggregationPipeline,
+    cross_collection::{CrossCollectionEngine, CrossCollectionPipeline, MultiCollectionOperation},
+    AggregationEngine,
+    QueryEngine,
+};
 use crate::tenants::{User, Tenant, Environment, Collection, AuthPayload};
 use crate::auth::{hash_password, verify_password, create_jwt_with_session, validate_jwt};
 use crate::session::{get_session_manager, Session};
@@ -137,12 +142,15 @@ async fn auth_middleware(
         insert_doc_handler,
         batch_insert_doc_handler,
         sql_handler,
+        aggregate_handler,
+        cross_collection_query_handler,
+        multi_collection_operation_handler,
         text_search_handler,
         hybrid_handler,
         health_handler
     ),
     components(
-        schemas(UserRegister, UserLogin, LoginResponse, InsertDocRest, BatchInsertDocRest, TextSearchRest, TextSearchResponse, DocumentSummary, RestResponse, CreateTenantRest, CreateEnvRest, CreateCollectionRest, SqlRest, HybridRest)
+        schemas(UserRegister, UserLogin, LoginResponse, InsertDocRest, BatchInsertDocRest, TextSearchRest, TextSearchResponse, DocumentSummary, RestResponse, CreateTenantRest, CreateEnvRest, CreateCollectionRest, SqlRest, HybridRest, AggregationRest, AggregationResponse, CrossCollectionQueryRest, CrossCollectionQueryResponse, MultiCollectionOperationRest, MultiCollectionOperationResponse)
     ),
     modifiers(&SecurityAddon),
     tags(
@@ -150,6 +158,45 @@ async fn auth_middleware(
     )
 )]
 struct ApiDoc;
+
+#[derive(Deserialize, ToSchema)]
+pub struct AggregationRest {
+    pub pipeline: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct AggregationResponse {
+    pub success: bool,
+    pub message: String,
+    pub results: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CrossCollectionQueryRest {
+    pub source: String,
+    pub stages: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CrossCollectionQueryResponse {
+    pub success: bool,
+    pub message: String,
+    pub results: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct MultiCollectionOperationRest {
+    pub operation: String,
+    pub collections: Vec<String>,
+    pub documents: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MultiCollectionOperationResponse {
+    pub success: bool,
+    pub message: String,
+    pub results: Vec<String>,
+}
 
 struct SecurityAddon;
 
@@ -186,6 +233,9 @@ pub fn create_router(storage: Storage) -> Router {
         .route("/collections/:collection_id/sql", post(sql_handler))
         .route("/collections/:collection_id/search", post(text_search_handler))
         .route("/collections/:collection_id/hybrid", post(hybrid_handler))
+        .route("/collections/:collection_id/aggregate", post(aggregate_handler))
+        .route("/collections/cross/query", post(cross_collection_query_handler))
+        .route("/collections/cross/operation", post(multi_collection_operation_handler))
         // RAG System endpoints
         .route("/collections/:collection_id/rag/ingest", post(rag_ingest_handler))
         .route("/collections/:collection_id/rag/search", post(rag_search_handler))
@@ -626,6 +676,139 @@ async fn sql_handler(
         message: format!("SQL executed: {} rows", res_ids.len()),
         results: res_ids,
         cache_hits: None,
+    }))
+}
+
+/// Handler: Aggregation pipeline
+#[utoipa::path(
+    post,
+    path = "/collections/{collection_id}/aggregate",
+    request_body = AggregationRest,
+    responses(
+        (status = 200, description = "Aggregation executed successfully", body = AggregationResponse),
+        (status = 400, description = "Bad request"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("collection_id" = String, Path, description = "Collection ID")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+async fn aggregate_handler(
+    State(state): State<Arc<AppState>>,
+    Path(collection_id): Path<String>,
+    Json(payload): Json<AggregationRest>,
+) -> Result<Json<AggregationResponse>, StatusCode> {
+    debug!(collection_id = %collection_id, "REST aggregation request");
+
+    let pipeline_value = serde_json::Value::Array(payload.pipeline);
+    let pipeline = AggregationPipeline::from_value(pipeline_value)
+        .map_err(|e| {
+            error!(error = %e, collection_id = %collection_id, "Aggregation pipeline parse failed");
+            StatusCode::BAD_REQUEST
+        })?;
+
+    let engine = AggregationEngine::new(state.storage.clone(), &collection_id);
+    let results = engine.execute(pipeline).map_err(|e| {
+        error!(error = %e, collection_id = %collection_id, "Aggregation execution failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(AggregationResponse {
+        success: true,
+        message: format!("Aggregation executed: {} results", results.len()),
+        results,
+    }))
+}
+
+/// Handler: Cross-collection query pipeline
+#[utoipa::path(
+    post,
+    path = "/collections/cross/query",
+    request_body = CrossCollectionQueryRest,
+    responses(
+        (status = 200, description = "Cross-collection query executed successfully", body = CrossCollectionQueryResponse),
+        (status = 400, description = "Bad request"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+async fn cross_collection_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CrossCollectionQueryRest>,
+) -> Result<Json<CrossCollectionQueryResponse>, StatusCode> {
+    debug!(source = %payload.source, "REST cross-collection query request");
+
+    let pipeline_value = serde_json::json!({
+        "source": payload.source,
+        "stages": payload.stages,
+    });
+
+    let pipeline = CrossCollectionPipeline::from_value(pipeline_value).map_err(|e| {
+        error!(error = %e, "Cross-collection pipeline parse failed");
+        StatusCode::BAD_REQUEST
+    })?;
+
+    let engine = CrossCollectionEngine::new(state.storage.clone());
+    let results = engine.execute(pipeline).map_err(|e| {
+        error!(error = %e, "Cross-collection execution failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(CrossCollectionQueryResponse {
+        success: true,
+        message: format!("Cross-collection query executed: {} results", results.len()),
+        results,
+    }))
+}
+
+/// Handler: Multi-collection insert/update/delete operation
+#[utoipa::path(
+    post,
+    path = "/collections/cross/operation",
+    request_body = MultiCollectionOperationRest,
+    responses(
+        (status = 200, description = "Multi-collection operation executed successfully", body = MultiCollectionOperationResponse),
+        (status = 400, description = "Bad request"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+async fn multi_collection_operation_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<MultiCollectionOperationRest>,
+) -> Result<Json<MultiCollectionOperationResponse>, StatusCode> {
+    debug!(operation = %payload.operation, "REST multi-collection operation request");
+
+    let operation_value = serde_json::json!({
+        "operation": payload.operation,
+        "collections": payload.collections,
+        "documents": payload.documents,
+    });
+
+    let operation = MultiCollectionOperation::from_value(operation_value).map_err(|e| {
+        error!(error = %e, "Multi-collection operation parse failed");
+        StatusCode::BAD_REQUEST
+    })?;
+
+    let engine = CrossCollectionEngine::new(state.storage.clone());
+    let results = engine
+        .execute_multi_collection_operation(operation)
+        .map_err(|e| {
+            error!(error = %e, "Multi-collection operation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(MultiCollectionOperationResponse {
+        success: true,
+        message: format!("Operation executed: {} results", results.len()),
+        results,
     }))
 }
 
