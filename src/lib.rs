@@ -21,3 +21,5 @@ pub mod logging;
 pub mod session;
 // RAG System modules
 pub mod rag;
+// Events module for real-time streaming and pub/sub (CDC)
+pub mod events;

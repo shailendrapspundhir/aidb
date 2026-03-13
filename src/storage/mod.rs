@@ -91,3 +91,78 @@ impl Storage {
         })
     }
 }
+
+use async_trait::async_trait;
+use crate::events::{PubSubManager, CdcEvent, EventType};
+use chrono::Utc;
+
+/// StorageEngine trait for abstracting storage operations
+#[async_trait]
+pub trait StorageEngine: Send + Sync {
+    async fn insert(&self, collection: &str, id: &str, document: serde_json::Value) -> Result<(), String>;
+    async fn get(&self, collection: &str, id: &str) -> Result<Option<serde_json::Value>, String>;
+    async fn update(&self, collection: &str, id: &str, document: serde_json::Value) -> Result<(), String>;
+    async fn delete(&self, collection: &str, id: &str) -> Result<(), String>;
+    async fn list_collections(&self) -> Result<Vec<String>, String>;
+}
+
+/// CDC Wrapper that wraps any StorageEngine and emits events on mutations
+pub struct CdcWrapper<T: StorageEngine> {
+    engine: Arc<T>,
+    pubsub: Arc<PubSubManager>,
+}
+
+impl<T: StorageEngine> CdcWrapper<T> {
+    pub fn new(engine: Arc<T>, pubsub: Arc<PubSubManager>) -> Self {
+        Self { engine, pubsub }
+    }
+}
+
+#[async_trait]
+impl<T: StorageEngine> StorageEngine for CdcWrapper<T> {
+    async fn insert(&self, collection: &str, id: &str, document: serde_json::Value) -> Result<(), String> {
+        let doc_clone = document.clone();
+        self.engine.insert(collection, id, document).await?;
+        self.pubsub.publish(CdcEvent {
+            event_type: EventType::Insert,
+            collection: collection.to_string(),
+            id: id.to_string(),
+            data: Some(doc_clone),
+            timestamp: Utc::now().timestamp(),
+        });
+        Ok(())
+    }
+
+    async fn get(&self, collection: &str, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.engine.get(collection, id).await
+    }
+
+    async fn update(&self, collection: &str, id: &str, document: serde_json::Value) -> Result<(), String> {
+        let doc_clone = document.clone();
+        self.engine.update(collection, id, document).await?;
+        self.pubsub.publish(CdcEvent {
+            event_type: EventType::Update,
+            collection: collection.to_string(),
+            id: id.to_string(),
+            data: Some(doc_clone),
+            timestamp: Utc::now().timestamp(),
+        });
+        Ok(())
+    }
+
+    async fn delete(&self, collection: &str, id: &str) -> Result<(), String> {
+        self.engine.delete(collection, id).await?;
+        self.pubsub.publish(CdcEvent {
+            event_type: EventType::Delete,
+            collection: collection.to_string(),
+            id: id.to_string(),
+            data: None,
+            timestamp: Utc::now().timestamp(),
+        });
+        Ok(())
+    }
+
+    async fn list_collections(&self) -> Result<Vec<String>, String> {
+        self.engine.list_collections().await
+    }
+}

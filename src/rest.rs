@@ -7,13 +7,15 @@
 
 use arrow::array::Array;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, State, WebSocketUpgrade},
+    extract::ws::{WebSocket, Message},
     http::{StatusCode, Request, header},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, post},
     Json, Router, Extension,
 };
+use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json;  // For JSON parsing in NoSQL handler
 use std::sync::Arc;
@@ -32,11 +34,13 @@ use crate::tenants::{User, Tenant, Environment, Collection, AuthPayload};
 use crate::auth::{hash_password, verify_password, create_jwt_with_session, validate_jwt};
 use crate::session::{get_session_manager, Session};
 use crate::logging::{read_logs_by_session, JsonLogEntry};
+use crate::events::{PubSubManager, CdcEvent};
 
 /// Shared app state for REST handlers (Arc-wrapped for concurrency)
 #[derive(Clone)]
 pub struct AppState {
     storage: Arc<Storage>,
+    pubsub: Arc<PubSubManager>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -220,6 +224,7 @@ impl utoipa::Modify for SecurityAddon {
 pub fn create_router(storage: Storage) -> Router {
     let state = Arc::new(AppState {
         storage: Arc::new(storage),
+        pubsub: Arc::new(PubSubManager::new(1024)),
     });
 
     let auth_routes = Router::new()
@@ -254,6 +259,7 @@ pub fn create_router(storage: Storage) -> Router {
         .route("/register", post(register_handler))
         .route("/login", post(login_handler))
         .route("/health", get(health_handler))
+        .route("/ws", get(ws_handler))
         .merge(auth_routes)
         .with_state(state)
 }
@@ -549,8 +555,25 @@ async fn insert_doc_handler(
     };
 
     // Insert to unified storage
-    if state.storage.insert_doc(doc, &collection_id).is_ok() {
+    if state.storage.insert_doc(doc.clone(), &collection_id).is_ok() {
         info!(collection_id = %collection_id, doc_id = %payload.id, "Document inserted via REST");
+        
+        // Publish CDC event
+        let doc_json = serde_json::json!({
+            "id": doc.id,
+            "text": doc.text,
+            "category": doc.category,
+            "vector": doc.vector,
+            "metadata": doc.metadata,
+        });
+        state.pubsub.publish(CdcEvent {
+            event_type: crate::events::EventType::Insert,
+            collection: collection_id.clone(),
+            id: payload.id.clone(),
+            data: Some(doc_json),
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+        
         Ok(Json(RestResponse {
             success: true,
             message: "NoSQL JSON doc inserted to Sled".to_string(),
@@ -951,6 +974,97 @@ async fn health_handler() -> Json<RestResponse> {
     })
 }
 
+/// WebSocket handler for real-time CDC streaming
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state))
+}
+
+/// Handle WebSocket connection for CDC subscriptions
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut rx = state.pubsub.subscribe();
+    let mut collection_subs = std::collections::HashSet::<String>::new();
+    let mut document_subs = std::collections::HashSet::<String>::new(); // format: "collection:id"
+
+    loop {
+        tokio::select! {
+            msg_result = receiver.next() => {
+                match msg_result {
+                    Some(Ok(msg)) => {
+                        if let Message::Text(text) = msg {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                                match val.get("action").and_then(|a| a.as_str()) {
+                                    Some("subscribe") => {
+                                        if let Some(collection) = val.get("collection").and_then(|c| c.as_str()) {
+                                            if let Some(id) = val.get("id").and_then(|i| i.as_str()) {
+                                                document_subs.insert(format!("{}:{}", collection, id));
+                                                let response = serde_json::json!({"status": "subscribed", "collection": collection, "id": id}).to_string();
+                                                let _ = sender.send(Message::Text(response)).await;
+                                            } else {
+                                                collection_subs.insert(collection.to_string());
+                                                let response = serde_json::json!({"status": "subscribed", "collection": collection}).to_string();
+                                                let _ = sender.send(Message::Text(response)).await;
+                                            }
+                                        }
+                                    }
+                                    Some("unsubscribe") => {
+                                        if let Some(collection) = val.get("collection").and_then(|c| c.as_str()) {
+                                            if let Some(id) = val.get("id").and_then(|i| i.as_str()) {
+                                                document_subs.remove(&format!("{}:{}", collection, id));
+                                                let response = serde_json::json!({"status": "unsubscribed", "collection": collection, "id": id}).to_string();
+                                                let _ = sender.send(Message::Text(response)).await;
+                                            } else {
+                                                collection_subs.remove(collection);
+                                                let response = serde_json::json!({"status": "unsubscribed", "collection": collection}).to_string();
+                                                let _ = sender.send(Message::Text(response)).await;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(_)) => {
+                        // WebSocket error, close connection
+                        break;
+                    }
+                    None => {
+                        // Connection closed
+                        break;
+                    }
+                }
+            }
+            event_result = rx.recv() => {
+                match event_result {
+                    Ok(event) => {
+                        let is_collection_sub = collection_subs.contains(&event.collection);
+                        let is_document_sub = document_subs.contains(&format!("{}:{}", event.collection, event.id));
+                        
+                        // If no subscriptions at all, it's a full CDC stream
+                        let should_send = (collection_subs.is_empty() && document_subs.is_empty()) || is_collection_sub || is_document_sub;
+                        
+                        if should_send {
+                            if let Ok(msg) = serde_json::to_string(&event) {
+                                if sender.send(Message::Text(msg)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Broadcast channel closed, exit
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- Additional CRUD Handlers for NoSQL/REST (edit/update , delete) ---
 
 /// DTO reuse for update (same as insert)
@@ -975,8 +1089,25 @@ async fn update_doc_handler(
         metadata: metadata_json,
     };
 
-    if state.storage.update_doc(doc, &collection_id).is_ok() {
+    if state.storage.update_doc(doc.clone(), &collection_id).is_ok() {
         info!(collection_id = %collection_id, doc_id = %payload.id, "Document updated via REST");
+        
+        // Publish CDC event
+        let doc_json = serde_json::json!({
+            "id": doc.id,
+            "text": doc.text,
+            "category": doc.category,
+            "vector": doc.vector,
+            "metadata": doc.metadata,
+        });
+        state.pubsub.publish(CdcEvent {
+            event_type: crate::events::EventType::Update,
+            collection: collection_id.clone(),
+            id: payload.id.clone(),
+            data: Some(doc_json),
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+        
         Ok(Json(RestResponse {
             success: true,
             message: "NoSQL doc updated".to_string(),
@@ -998,6 +1129,16 @@ async fn delete_doc_handler(
     
     if state.storage.delete_doc(&collection_id, &doc_id).is_ok() {
         info!(collection_id = %collection_id, doc_id = %doc_id, "Document deleted via REST");
+        
+        // Publish CDC event
+        state.pubsub.publish(CdcEvent {
+            event_type: crate::events::EventType::Delete,
+            collection: collection_id.clone(),
+            id: doc_id.clone(),
+            data: None,
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+        
         Ok(Json(RestResponse {
             success: true,
             message: format!("Doc {} deleted", doc_id),
